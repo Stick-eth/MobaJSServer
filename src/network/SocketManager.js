@@ -23,8 +23,19 @@ module.exports = {
       // Informe les autres de l'arrivée de ce joueur
       socket.broadcast.emit('playerJoined', players[socket.id]);
 
+      
+      socket.on('autoattack', (data) => {
+        console.log('Handler autoattack appelé', data);
+        io.emit('autoattack', {
+          from: data.from,
+          targetId: data.targetId,
+          pos: data.pos
+        });
+      });
+
       // Quand on reçoit la position du joueur
       socket.on('playerPosition', (data) => {
+        console.log(`Position update from ${socket.id}:`, data);
         if (players[socket.id]) {
           // Arrondit à 2 décimales
           players[socket.id].x = round2(data.x);
@@ -39,6 +50,14 @@ module.exports = {
 
           // Broadcast à tous sauf au joueur qui a envoyé
           socket.broadcast.emit('playerPositionUpdate', positionUpdate);
+        }
+      });
+
+      // Log tous les autres events non traités spécifiquement
+      socket.onAny((event, ...args) => {
+        // Ignore les events déjà traités si tu veux
+        if (event !== 'playerPosition' && event !== 'disconnect') {
+          console.log(`Event inconnu reçu : "${event}" de ${socket.id} | data :`, ...args);
         }
       });
 
