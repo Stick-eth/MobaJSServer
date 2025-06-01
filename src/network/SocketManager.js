@@ -33,6 +33,16 @@ module.exports = {
         });
       });
 
+      socket.on('spellCast', (data) => {
+        console.log('Handler spellCast appelé', data);
+        io.emit('spellCast', {
+          spell : data.spell,
+          from: data.from,
+          pos: data.pos,
+          dir : data.dir
+        });
+      });
+
       // Quand on reçoit la position du joueur
       socket.on('playerPosition', (data) => {
         console.log(`Position update from ${socket.id}:`, data);
