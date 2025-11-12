@@ -14,6 +14,9 @@ let projectileLoop = null;
 let heartbeatInterval = null;
 let nextProjectileId = 1;
 
+const TEAM_BLUE = 'blue';
+const TEAM_RED = 'red';
+
 const TICK_MS = 50; // 20 ticks/s
 const RESPAWN_MS = 5000;
 const SUMMONER_COOLDOWNS_MS = {
@@ -110,6 +113,7 @@ function createPlayerState(id) {
     dead: false,
     spawnX: 0,
     spawnZ: 0,
+    team: null,
     classId: DEFAULT_CLASS_ID,
     aaType: 'ranged',
     aaSpeed: 0,
@@ -170,12 +174,32 @@ function serializePlayer(player) {
     hp: player.hp,
     maxHp: player.maxHp,
     dead: player.dead,
+    team: player.team,
     classId: player.classId,
     level: player.level,
     xp: player.xp,
     xpToNext: player.xpToNext,
     moveSpeed: player.moveSpeed
   };
+}
+
+function pickTeam() {
+  const counts = {
+    [TEAM_BLUE]: 0,
+    [TEAM_RED]: 0
+  };
+  Object.values(players).forEach(player => {
+    if (player.team === TEAM_BLUE) counts[TEAM_BLUE] += 1;
+    else if (player.team === TEAM_RED) counts[TEAM_RED] += 1;
+  });
+  if (counts[TEAM_BLUE] <= counts[TEAM_RED]) return TEAM_BLUE;
+  return TEAM_RED;
+}
+
+function areAllies(playerA, playerB) {
+  if (!playerA || !playerB) return false;
+  if (!playerA.team || !playerB.team) return false;
+  return playerA.team === playerB.team;
 }
 
 function round2(num) {
@@ -333,6 +357,7 @@ function stepProjectiles() {
   const dt = TICK_MS / 1000;
   for (let i = activeProjectiles.length - 1; i >= 0; i--) {
     const p = activeProjectiles[i];
+    const owner = players[p.ownerId];
     // homing: update direction toward current target position
     if (p.homing && p.targetId) {
       const tgt = players[p.targetId];
@@ -355,6 +380,7 @@ function stepProjectiles() {
     for (const [id, pl] of Object.entries(players)) {
       if (id === p.ownerId) continue; // pas soi-même
       if (pl.dead) continue;
+      if (areAllies(pl, owner)) continue;
       const dx = pl.x - p.x;
       const dz = pl.z - p.z;
       const dist2 = dx*dx + dz*dz;
@@ -386,6 +412,9 @@ function stepProjectiles() {
 function applyDamage(targetId, amount, fromId, source) {
   const target = players[targetId];
   if (!target || target.dead) return;
+
+  const attacker = fromId ? players[fromId] : null;
+  if (areAllies(target, attacker)) return;
 
   // track last hitter for death summary
   target.lastHitFrom = fromId;
@@ -424,7 +453,7 @@ function handleDeath(id) {
     p.x = round2(p.spawnX);
     p.z = round2(p.spawnZ);
     p.dead = false;
-    io.emit('playerRespawned', { id, x: p.x, z: p.z, hp: p.hp, maxHp: p.maxHp, classId: p.classId });
+    io.emit('playerRespawned', { id, x: p.x, z: p.z, hp: p.hp, maxHp: p.maxHp, classId: p.classId, team: p.team });
     broadcastProgress(p);
   }, RESPAWN_MS);
 }
@@ -457,13 +486,16 @@ module.exports = {
       logger.netIn('connect', { from: socket.id, data: { address: socket.handshake?.address } });
 
       // No patching of emit; we'll log specific emissions below as needed
-      const player = createPlayerState(socket.id);
-      applyClassToPlayer(player, DEFAULT_CLASS_ID, { resetHp: true });
-      players[socket.id] = player;
+    const player = createPlayerState(socket.id);
+    applyClassToPlayer(player, DEFAULT_CLASS_ID, { resetHp: true });
+    player.team = pickTeam();
+    players[socket.id] = player;
 
       const connectedPlayers = Object.values(players).map(serializePlayer);
       logger.netOut('playersList', { to: socket.id, data: connectedPlayers });
       socket.emit('playersList', connectedPlayers);
+    socket.emit('teamAssignment', { id: socket.id, team: player.team });
+    socket.broadcast.emit('teamAssignment', { id: socket.id, team: player.team });
     broadcastProgress(player, { targetSocket: socket });
 
       const joinPayload = serializePlayer(players[socket.id]);
@@ -480,6 +512,7 @@ module.exports = {
         const target = players[targetId];
         if (!from || from.dead) return;
         if (!target || target.dead) return;
+    if (areAllies(from, target)) return;
         const payloadPos = data && data.pos;
         if (payloadPos && typeof payloadPos.x === 'number' && typeof payloadPos.z === 'number') {
           from.x = round2(payloadPos.x);
