@@ -1,5 +1,6 @@
 const { Server } = require('socket.io');
 const logger = require('../utils/logger');
+const MinionManager = require('../minions/minionManager');
 
 let io = null;
 
@@ -10,9 +11,10 @@ const players = {};
 // Projectiles serveur en vol pour validation de collisions
 // [{ id, ownerId, x, z, dx, dz, speed, radius, ttl, targetId?, homing? }]
 let activeProjectiles = [];
-let projectileLoop = null;
 let heartbeatInterval = null;
 let nextProjectileId = 1;
+let gameLoop = null;
+let lastTickAt = Date.now();
 
 const TEAM_BLUE = 'blue';
 const TEAM_RED = 'red';
@@ -341,20 +343,27 @@ function awardKillExperience(killerId, victim) {
   addExperience(killer, xpGain);
 }
 
+function ensureGameLoop() {
+  if (gameLoop) return;
+  lastTickAt = Date.now();
+  gameLoop = setInterval(() => {
+    const now = Date.now();
+    const dtMs = now - lastTickAt;
+    lastTickAt = now;
+    const dt = Math.min(Math.max(dtMs, 0) / 1000, 0.25);
+    updateProjectiles(dt);
+    MinionManager.update(dt);
+  }, TICK_MS);
+}
+
 function startProjectileLoop() {
-  if (projectileLoop) return;
-  projectileLoop = setInterval(stepProjectiles, TICK_MS);
+  ensureGameLoop();
 }
 
-function stopProjectileLoopIfIdle() {
-  if (activeProjectiles.length === 0 && projectileLoop) {
-    clearInterval(projectileLoop);
-    projectileLoop = null;
+function updateProjectiles(dt) {
+  if (!activeProjectiles.length) {
+    return;
   }
-}
-
-function stepProjectiles() {
-  const dt = TICK_MS / 1000;
   for (let i = activeProjectiles.length - 1; i >= 0; i--) {
     const p = activeProjectiles[i];
     const owner = players[p.ownerId];
@@ -402,10 +411,6 @@ function stepProjectiles() {
     if (hit || p.ttl <= 0) {
       activeProjectiles.splice(i, 1);
     }
-  }
-
-  if (activeProjectiles.length === 0) {
-    stopProjectileLoopIfIdle();
   }
 }
 
@@ -480,6 +485,10 @@ module.exports = {
 
     logger.info('Socket.io CORS configured', { cors: corsConfig });
 
+    MinionManager.init({ io, logger })
+      .catch(error => logger.error('Minion manager init error', { error: error.message }));
+    ensureGameLoop();
+
     // Avoid monkey-patching socket.io emit functions to prevent any side-effects on event loop
 
     io.on('connection', (socket) => {
@@ -497,6 +506,8 @@ module.exports = {
     socket.emit('teamAssignment', { id: socket.id, team: player.team });
     socket.broadcast.emit('teamAssignment', { id: socket.id, team: player.team });
     broadcastProgress(player, { targetSocket: socket });
+
+    MinionManager.handleConnection(socket);
 
       const joinPayload = serializePlayer(players[socket.id]);
       logger.netOut('playerJoined', { from: socket.id, to: 'broadcast', data: joinPayload });
