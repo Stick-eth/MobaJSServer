@@ -1,6 +1,10 @@
 const fs = require('fs');
 const path = require('path');
 const { PNG } = require('pngjs');
+const {
+  PLAYER_MELEE_ATTACK_RANGE,
+  PLAYER_RANGED_ATTACK_RANGE
+} = require('../data/classDefinitions');
 
 const TEAM_BLUE = 'blue';
 const TEAM_RED = 'red';
@@ -9,29 +13,80 @@ const TEAMS = [TEAM_BLUE, TEAM_RED];
 const TERRAIN_SIZE = 100;
 const LANE_COUNT = 3;
 
-const MINIONS_PER_WAVE = 6;
 const MINION_BASE_SPEED = 2.6; // units per second
 const MINION_SPACING = 1.5; // minimal distance along the path
-const MINION_RADIUS = 0.55;
-const MINION_MAX_FORCE = 18;
+const MINION_RADIUS = 0.45;
+const MINION_MAX_FORCE = 15;
 const MINION_DAMPING = 0.94;
 const MINION_BROADCAST_INTERVAL_S = 0.1;
 const WAVE_INTERVAL_S = 30;
 const INITIAL_WAVE_DELAY_S = 5;
+const MINION_PROJECTILE_HEIGHT = 0.55;
+const PATH_STRAY_THRESHOLD = 4.5;
+const MINION_RETARGET_COOLDOWN = 0.5;
+const RETARGET_RANGE_MARGIN = 1.1;
+const MOVEMENT_SMOOTHING_RATE = 6;
 
 const PATH_LOOKAHEAD_PIXELS = 30;
 const MIN_LOOKAHEAD_WORLD = 1.5;
 const PATH_REJOIN_THRESHOLD = 1.2;
-const PATH_CORRECTION_WEIGHT = 6.5;
+const PATH_CORRECTION_WEIGHT = 5.4;
 
 const ALLY_SEPARATION_DISTANCE = MINION_RADIUS * 2.4;
 const ENEMY_SEPARATION_DISTANCE = MINION_RADIUS * 2.8;
-const ALLY_SEPARATION_WEIGHT = 8;
-const ENEMY_SEPARATION_WEIGHT = 13;
+const ALLY_SEPARATION_WEIGHT = 6.75;
+const ENEMY_SEPARATION_WEIGHT = 9.5;
+
+const BASE_VISION_RADIUS = PLAYER_RANGED_ATTACK_RANGE * 2;
+const ENABLE_MINION_TRAFFIC_LOGS = false;
 
 const STUCK_SPEED_THRESHOLD = 0.25;
 const STUCK_TIME_THRESHOLD = 0.45;
 const STUCK_SIDE_FORCE = 6;
+
+const CANNON_WAVE_FREQUENCY = 3;
+const CANNON_INSERT_INDEX = 3;
+
+const MINION_TYPES = {
+  melee: {
+    id: 'melee',
+    maxHp: 480,
+    damage: 12,
+    attackRange: PLAYER_MELEE_ATTACK_RANGE * 0.35,
+    detectionRadius: BASE_VISION_RADIUS,
+    attackInterval: 0.8,
+    speedMultiplier: 1.0,
+    radius: 0.48,
+    holdDistanceFactor: 0
+  },
+  ranged: {
+    id: 'ranged',
+    maxHp: 300,
+    damage: 24,
+    attackRange: PLAYER_RANGED_ATTACK_RANGE,
+  detectionRadius: BASE_VISION_RADIUS,
+    attackInterval: 1.5,
+    speedMultiplier: 0.95,
+    radius: 0.4,
+    holdDistanceFactor: 0,
+    projectileSpeed: 14
+  },
+  cannon: {
+    id: 'cannon',
+    maxHp: 700,
+    damage: 40,
+    attackRange: PLAYER_RANGED_ATTACK_RANGE,
+  detectionRadius: BASE_VISION_RADIUS,
+    attackInterval: 1.0,
+    speedMultiplier: 0.85,
+    radius: 0.58,
+    holdDistanceFactor: 0,
+    projectileSpeed: 12
+  }
+};
+
+const DEFAULT_MINION_TYPE = 'melee';
+const BASE_WAVE_COMPOSITION = ['melee', 'melee', 'melee', 'ranged', 'ranged', 'ranged'];
 
 const MAP_ROOT = path.resolve(__dirname, '..', 'maps', 'base_map');
 
@@ -50,11 +105,17 @@ const state = {
   nextMinionId: 1,
   broadcastTimer: 0,
   waveTimer: 0,
-  firstWaveDelay: INITIAL_WAVE_DELAY_S
+  firstWaveDelay: INITIAL_WAVE_DELAY_S,
+  pendingRemovals: [],
+  waveCounts: {
+    [TEAM_BLUE]: 0,
+    [TEAM_RED]: 0
+  }
 };
 
 let ioRef = null;
 let loggerRef = null;
+let nextMinionProjectileId = 1;
 
 class LinearPath {
   constructor(points) {
@@ -95,7 +156,6 @@ class LinearPath {
       const origin = this.points[0];
       return origin ? { x: origin.x, z: origin.z } : { x: 0, z: 0 };
     }
-
     const clamped = this.clampDistance(distance);
     for (let i = 0; i < this.segments.length; i += 1) {
       const segment = this.segments[i];
@@ -189,6 +249,24 @@ function round2(value) {
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(value, max));
+}
+
+function distanceSquared(ax, az, bx, bz) {
+  const dx = ax - bx;
+  const dz = az - bz;
+  return dx * dx + dz * dz;
+}
+
+function getMinionType(type) {
+  return MINION_TYPES[type] || MINION_TYPES[DEFAULT_MINION_TYPE];
+}
+
+function buildWaveComposition(waveIndex) {
+  const composition = [...BASE_WAVE_COMPOSITION];
+  if (waveIndex > 0 && waveIndex % CANNON_WAVE_FREQUENCY === 0) {
+    composition.splice(CANNON_INSERT_INDEX, 0, 'cannon');
+  }
+  return composition;
 }
 
 function uvToWorld(u, v, terrainSize) {
@@ -404,13 +482,92 @@ function serializeMinion(minion) {
     id: minion.id,
     team: minion.team,
     lane: minion.lane,
+    type: minion.type,
     x: round2(minion.position.x),
     z: round2(minion.position.z),
     vx: round2(minion.velocity?.x || 0),
     vz: round2(minion.velocity?.z || 0),
     speed: round2(minion.speed || MINION_BASE_SPEED),
+    hp: Math.max(0, Math.round(minion.hp ?? 0)),
+    maxHp: Math.max(1, Math.round(minion.maxHp ?? 1)),
+    targetId: minion.targetId ?? null,
     arrived: Boolean(minion.arrived)
   };
+}
+
+function queueMinionRemoval(minion, options = {}) {
+  if (!minion || minion.dead) {
+    return;
+  }
+  minion.dead = true;
+  state.minions.delete(minion.id);
+  state.pendingRemovals.push({
+    id: minion.id,
+    team: minion.team,
+    lane: minion.lane,
+    type: minion.type,
+    cause: options.cause || 'combat',
+    killerId: options.killerId || null
+  });
+}
+
+function broadcastRemovals(removals) {
+  if (!ioRef || !removals.length) {
+    return;
+  }
+  const payload = { ids: removals.map(r => r.id), details: removals };
+  if (ENABLE_MINION_TRAFFIC_LOGS) {
+    loggerRef?.netOut('minionsRemoved', { to: 'all', data: payload });
+  }
+  ioRef.emit('minionsRemoved', payload);
+}
+
+function broadcastMinionProjectile(minion, target) {
+  if (!ioRef || !minion || !target) {
+    return;
+  }
+  const projectileId = nextMinionProjectileId++;
+  const origin = {
+    x: round2(minion.position.x),
+    y: round2(MINION_PROJECTILE_HEIGHT),
+    z: round2(minion.position.z)
+  };
+  const destination = {
+    x: round2(target.position.x),
+    y: round2(MINION_PROJECTILE_HEIGHT),
+    z: round2(target.position.z)
+  };
+  const speed = Math.max(1, minion.projectileSpeed || 12);
+  const payload = {
+    id: projectileId,
+    fromId: minion.id,
+    fromTeam: minion.team,
+    type: minion.type,
+    origin,
+    destination,
+    targetId: target.id,
+    speed
+  };
+  if (ENABLE_MINION_TRAFFIC_LOGS) {
+    loggerRef?.netOut('minionProjectile', { to: 'all', data: payload });
+  }
+  ioRef.emit('minionProjectile', payload);
+}
+
+function applyDamageToMinion(attacker, target, amount) {
+  if (!target || target.dead) {
+    return false;
+  }
+  const damage = Math.max(0, amount || 0);
+  if (damage <= 0) {
+    return false;
+  }
+  target.hp = Math.max(0, (target.hp ?? target.maxHp) - damage);
+  if (target.hp === 0) {
+    queueMinionRemoval(target, { cause: 'combat', killerId: attacker?.id || null });
+    return true;
+  }
+  return false;
 }
 
 function broadcastSnapshot(target) {
@@ -421,10 +578,14 @@ function broadcastSnapshot(target) {
     minions: Array.from(state.minions.values()).map(serializeMinion)
   };
   if (target) {
-    loggerRef?.netOut('minionSnapshot', { to: target.id, data: payload });
+    if (ENABLE_MINION_TRAFFIC_LOGS) {
+      loggerRef?.netOut('minionSnapshot', { to: target.id, data: payload });
+    }
     target.emit('minionSnapshot', payload);
   } else {
-    loggerRef?.netOut('minionSnapshot', { to: 'all', data: payload });
+    if (ENABLE_MINION_TRAFFIC_LOGS) {
+      loggerRef?.netOut('minionSnapshot', { to: 'all', data: payload });
+    }
     ioRef.emit('minionSnapshot', payload);
   }
 }
@@ -436,7 +597,9 @@ function broadcastSpawn(minions) {
   const payload = {
     minions: minions.map(serializeMinion)
   };
-  loggerRef?.netOut('minionsSpawned', { to: 'all', data: payload });
+  if (ENABLE_MINION_TRAFFIC_LOGS) {
+    loggerRef?.netOut('minionsSpawned', { to: 'all', data: payload });
+  }
   ioRef.emit('minionsSpawned', payload);
 }
 
@@ -450,7 +613,8 @@ function broadcastUpdates() {
   ioRef.emit('minionsUpdated', payload);
 }
 
-function createMinion({ team, lane, path, baseDistance, lookAhead }) {
+function createMinion({ team, lane, type, path, baseDistance, lookAhead }) {
+  const typeDef = getMinionType(type);
   const clamped = path.clampDistance(baseDistance);
   const position = path.getPointAtDistance(clamped);
   const id = state.nextMinionId;
@@ -459,15 +623,29 @@ function createMinion({ team, lane, path, baseDistance, lookAhead }) {
     id,
     team,
     lane,
+    type: typeDef.id,
     path,
     distance: clamped,
-    speed: MINION_BASE_SPEED,
-    radius: MINION_RADIUS,
+    speed: MINION_BASE_SPEED * (typeDef.speedMultiplier || 1),
+    radius: typeDef.radius ?? MINION_RADIUS,
     position: { ...position },
     velocity: { x: 0, z: 0 },
     stuckTimer: 0,
     lookAhead: Math.max(lookAhead || MIN_LOOKAHEAD_WORLD, MIN_LOOKAHEAD_WORLD),
-    arrived: path.totalLength > 0 && clamped >= path.totalLength - 0.05
+    maxHp: typeDef.maxHp,
+    hp: typeDef.maxHp,
+    damage: typeDef.damage,
+    attackRange: typeDef.attackRange,
+    detectionRadius: typeDef.detectionRadius,
+    attackInterval: typeDef.attackInterval,
+    attackTimer: 0,
+    holdDistanceFactor: typeDef.holdDistanceFactor ?? 0.75,
+    projectileSpeed: typeDef.projectileSpeed || 0,
+    retargetCooldown: 0,
+    targetId: null,
+    mode: 'path',
+    arrived: path.totalLength > 0 && clamped >= path.totalLength - 0.05,
+    dead: false
   };
 }
 
@@ -477,23 +655,29 @@ function spawnWaveForTeam(team) {
     return;
   }
 
+  state.waveCounts[team] = (state.waveCounts[team] || 0) + 1;
+  const composition = buildWaveComposition(state.waveCounts[team]);
+
   const spawned = [];
   lanes.forEach((laneConfig, index) => {
     if (!laneConfig?.path) {
       return;
     }
-    for (let i = 0; i < MINIONS_PER_WAVE; i += 1) {
+    const slots = composition.length;
+    composition.forEach((typeKey, slotIndex) => {
+      const frontOffset = Math.max(0, (slots - 1 - slotIndex) * MINION_SPACING);
       const minion = createMinion({
         team,
         lane: index + 1,
+        type: typeKey,
         path: laneConfig.path,
-        baseDistance: Math.max(0, i * MINION_SPACING),
+        baseDistance: frontOffset,
         lookAhead: laneConfig.lookAhead
       });
       // adjust id increment (createMinion increments after creation)
       state.minions.set(minion.id, minion);
       spawned.push(minion);
-    }
+    });
   });
 
   if (spawned.length) {
@@ -523,49 +707,154 @@ function advanceMinions(dt) {
     if (!minion.velocity) {
       minion.velocity = { x: 0, z: 0 };
     }
-  });
-
-  minionList.forEach(minion => {
+    minion.attackTimer = Math.max(0, (minion.attackTimer || 0) - dt);
+    minion.retargetCooldown = Math.max(0, (minion.retargetCooldown || 0) - dt);
     if (minion.arrived) {
       minion.velocity.x = 0;
       minion.velocity.z = 0;
+    }
+    if (minion.dead || minion.arrived) {
+      minion.smoothedVelocity = null;
+    }
+    if (minion.targetId) {
+      const target = state.minions.get(minion.targetId);
+      if (!target || target.dead || target.team === minion.team) {
+        minion.targetId = null;
+        minion.mode = 'path';
+      }
+    }
+  });
+
+  minionList.forEach(minion => {
+    if (minion.dead || minion.arrived) {
       return;
     }
+    const detection = Math.max(minion.detectionRadius || 0, minion.attackRange || 0);
+    const detectionSq = detection * detection;
+    const currentTarget = minion.targetId ? state.minions.get(minion.targetId) : null;
+    let target = (currentTarget && !currentTarget.dead) ? currentTarget : null;
+    let targetDistSq = Number.POSITIVE_INFINITY;
 
-    const pathProjection = minion.path.projectPoint(minion.position);
-    let projectedDistance = minion.distance;
-    let deviation = 0;
-    if (pathProjection) {
-      deviation = Math.sqrt(pathProjection.dist2);
-      if (Number.isFinite(pathProjection.distance)) {
-        projectedDistance = Math.max(minion.distance, pathProjection.distance - 0.2);
-        minion.distance = projectedDistance;
+    if (target) {
+      targetDistSq = distanceSquared(minion.position.x, minion.position.z, target.position.x, target.position.z);
+      if (targetDistSq > detectionSq) {
+        target = null;
+      } else {
+        const attackReach = (minion.attackRange || 0) + minion.radius + (target.radius || MINION_RADIUS) * 0.5;
+        const maxRangeSq = attackReach * attackReach * RETARGET_RANGE_MARGIN;
+        if (targetDistSq > maxRangeSq && minion.retargetCooldown <= 0) {
+          target = null;
+        }
       }
     }
 
-    const lookAhead = deviation > PATH_REJOIN_THRESHOLD
-      ? minion.lookAhead
-      : Math.max(minion.lookAhead * 0.5, MIN_LOOKAHEAD_WORLD);
+    if (!target && minion.retargetCooldown <= 0) {
+      let best = null;
+      let bestDistSq = Number.POSITIVE_INFINITY;
+      minionList.forEach(other => {
+        if (other === minion || other.dead || other.team === minion.team) {
+          return;
+        }
+        const distSq = distanceSquared(minion.position.x, minion.position.z, other.position.x, other.position.z);
+        if (distSq > detectionSq) {
+          return;
+        }
+        if (distSq < bestDistSq) {
+          best = other;
+          bestDistSq = distSq;
+        }
+      });
+      if (best) {
+        target = best;
+        minion.retargetCooldown = MINION_RETARGET_COOLDOWN;
+      }
+    }
 
-    const targetDistance = minion.path.clampDistance(projectedDistance + lookAhead);
-    const targetPoint = minion.path.getPointAtDistance(targetDistance);
+    if (target) {
+      minion.targetId = target.id;
+      minion.mode = 'engage';
+    } else {
+      minion.targetId = null;
+      minion.mode = 'path';
+    }
+  });
+
+  minionList.forEach(minion => {
+    if (minion.dead || minion.arrived) {
+      return;
+    }
+
+    let target = minion.targetId ? state.minions.get(minion.targetId) : null;
+    let engaged = Boolean(target && !target.dead && minion.mode === 'engage');
+
+    const pathProjection = minion.path.projectPoint(minion.position);
+    if (pathProjection && Number.isFinite(pathProjection.distance)) {
+      minion.distance = Math.max(minion.distance, pathProjection.distance - 0.2);
+    }
+
+    let deviation = pathProjection ? Math.sqrt(pathProjection.dist2) : 0;
+
+    if (deviation > PATH_STRAY_THRESHOLD) {
+      minion.targetId = null;
+      target = null;
+      minion.mode = 'path';
+      engaged = false;
+      minion.retargetCooldown = Math.max(minion.retargetCooldown, MINION_RETARGET_COOLDOWN * 0.5);
+    }
+
+    const lookAhead = !engaged && deviation <= PATH_REJOIN_THRESHOLD
+      ? Math.max(minion.lookAhead * 0.5, MIN_LOOKAHEAD_WORLD)
+      : minion.lookAhead;
+
+    const targetDistance = engaged
+      ? minion.distance
+      : minion.path.clampDistance(minion.distance + lookAhead);
+    const targetPoint = engaged && target
+      ? { x: target.position.x, z: target.position.z }
+      : minion.path.getPointAtDistance(targetDistance);
+
+    let desiredDir = { x: 0, z: 1 };
     const toTarget = {
       x: targetPoint.x - minion.position.x,
       z: targetPoint.z - minion.position.z
     };
     const toTargetLen = Math.hypot(toTarget.x, toTarget.z);
-    let desiredDir = { x: 0, z: 1 };
-    if (toTargetLen > 1e-4) {
+
+    const maxSpeed = minion.speed;
+
+    if (engaged && target) {
+      const dist = toTargetLen || 0.0001;
+      const norm = { x: toTarget.x / dist, z: toTarget.z / dist };
+      const effectiveRange = minion.attackRange + minion.radius + (target.radius || MINION_RADIUS) * 0.5;
+      const holdRange = minion.holdDistanceFactor > 0 ? effectiveRange * minion.holdDistanceFactor : 0;
+
+      if (dist > effectiveRange * 0.92) {
+        desiredDir = norm;
+      } else if (holdRange > 0 && dist < holdRange) {
+        desiredDir = { x: -norm.x, z: -norm.z };
+      } else {
+        desiredDir = { x: 0, z: 0 };
+      }
+      deviation = 0; // reduce correction pressure while fighting
+    } else if (toTargetLen > 1e-4) {
       desiredDir = { x: toTarget.x / toTargetLen, z: toTarget.z / toTargetLen };
     } else {
       desiredDir = minion.path.getTangentAtDistance(targetDistance);
     }
 
-    const maxSpeed = minion.speed;
-    const desiredVelocity = {
+    const rawDesiredVelocity = {
       x: desiredDir.x * maxSpeed,
       z: desiredDir.z * maxSpeed
     };
+    const smoothingBlend = clamp(dt * MOVEMENT_SMOOTHING_RATE, 0, 1);
+    if (!minion.smoothedVelocity) {
+      minion.smoothedVelocity = { x: rawDesiredVelocity.x, z: rawDesiredVelocity.z };
+    } else {
+      minion.smoothedVelocity.x += (rawDesiredVelocity.x - minion.smoothedVelocity.x) * smoothingBlend;
+      minion.smoothedVelocity.z += (rawDesiredVelocity.z - minion.smoothedVelocity.z) * smoothingBlend;
+    }
+
+    const desiredVelocity = minion.smoothedVelocity;
 
     const steer = limitVector({
       x: desiredVelocity.x - minion.velocity.x,
@@ -577,7 +866,7 @@ function advanceMinions(dt) {
       z: steer.z
     };
 
-    if (pathProjection && pathProjection.point && deviation > 0.01) {
+    if (!engaged && pathProjection && pathProjection.point && deviation > 0.01) {
       const toPath = {
         x: pathProjection.point.x - minion.position.x,
         z: pathProjection.point.z - minion.position.z
@@ -590,7 +879,7 @@ function advanceMinions(dt) {
     let closestEnemy = Number.POSITIVE_INFINITY;
 
     minionList.forEach(other => {
-      if (other === minion) {
+      if (other === minion || other.dead) {
         return;
       }
       const dx = minion.position.x - other.position.x;
@@ -599,7 +888,9 @@ function advanceMinions(dt) {
       if (dist <= 1e-5) {
         return;
       }
-      const range = other.team === minion.team ? ALLY_SEPARATION_DISTANCE : ENEMY_SEPARATION_DISTANCE;
+      const baseGap = minion.radius + (other.radius || MINION_RADIUS) + 0.1;
+      const desiredGap = other.team === minion.team ? ALLY_SEPARATION_DISTANCE : ENEMY_SEPARATION_DISTANCE;
+      const range = Math.max(desiredGap, baseGap);
       if (other.team !== minion.team && dist < closestEnemy) {
         closestEnemy = dist;
       }
@@ -627,10 +918,10 @@ function advanceMinions(dt) {
       minion.stuckTimer = 0;
     }
 
-  const finalForce = limitVector(force, MINION_MAX_FORCE);
+    const finalForce = limitVector(force, MINION_MAX_FORCE);
 
-  minion.velocity.x += finalForce.x * dt;
-  minion.velocity.z += finalForce.z * dt;
+    minion.velocity.x += finalForce.x * dt;
+    minion.velocity.z += finalForce.z * dt;
 
     minion.velocity.x *= MINION_DAMPING;
     minion.velocity.z *= MINION_DAMPING;
@@ -644,9 +935,9 @@ function advanceMinions(dt) {
 
     minion.position.x += minion.velocity.x * dt;
     minion.position.z += minion.velocity.z * dt;
-  const halfSize = TERRAIN_SIZE * 0.5;
-  minion.position.x = clamp(minion.position.x, -halfSize, halfSize);
-  minion.position.z = clamp(minion.position.z, -halfSize, halfSize);
+    const halfSize = TERRAIN_SIZE * 0.5;
+    minion.position.x = clamp(minion.position.x, -halfSize, halfSize);
+    minion.position.z = clamp(minion.position.z, -halfSize, halfSize);
 
     const updatedProjection = minion.path.projectPoint(minion.position);
     if (updatedProjection) {
@@ -656,7 +947,7 @@ function advanceMinions(dt) {
     minion.distance = minion.path.clampDistance(minion.distance);
 
     const remaining = minion.path.totalLength - minion.distance;
-    if (remaining <= 0.3) {
+    if (!engaged && remaining <= 0.3) {
       const goal = minion.path.getPointAtDistance(minion.path.totalLength);
       const goalDist = Math.hypot(minion.position.x - goal.x, minion.position.z - goal.z);
       if (goalDist <= 0.4) {
@@ -665,6 +956,37 @@ function advanceMinions(dt) {
         minion.velocity.x = 0;
         minion.velocity.z = 0;
         minion.arrived = true;
+      }
+    }
+  });
+
+  minionList.forEach(minion => {
+    if (minion.dead || minion.arrived || !minion.targetId) {
+      return;
+    }
+    const target = state.minions.get(minion.targetId);
+    if (!target || target.dead) {
+      minion.targetId = null;
+      minion.mode = 'path';
+      return;
+    }
+    const dist = Math.hypot(target.position.x - minion.position.x, target.position.z - minion.position.z);
+    const detection = Math.max(minion.detectionRadius || 0, minion.attackRange || 0);
+    if (dist > detection * 1.25) {
+      minion.targetId = null;
+      minion.mode = 'path';
+      return;
+    }
+    const effectiveRange = minion.attackRange + minion.radius + (target.radius || MINION_RADIUS) * 0.5;
+    if (dist <= effectiveRange && (minion.attackTimer || 0) <= 0) {
+      if (minion.type !== 'melee') {
+        broadcastMinionProjectile(minion, target);
+      }
+      const killed = applyDamageToMinion(minion, target, minion.damage);
+      minion.attackTimer = minion.attackInterval;
+      if (killed) {
+        minion.targetId = null;
+        minion.mode = 'path';
       }
     }
   });
@@ -689,6 +1011,11 @@ function update(dt) {
   }
 
   advanceMinions(dt);
+
+  if (state.pendingRemovals.length) {
+    const removals = state.pendingRemovals.splice(0, state.pendingRemovals.length);
+    broadcastRemovals(removals);
+  }
 
   state.broadcastTimer += dt;
   if (state.broadcastTimer >= MINION_BROADCAST_INTERVAL_S) {
@@ -720,6 +1047,9 @@ function handleConnection(socket) {
     return;
   }
   broadcastSnapshot(socket);
+  socket.on('requestMinionSnapshot', () => {
+    broadcastSnapshot(socket);
+  });
 }
 
 module.exports = {

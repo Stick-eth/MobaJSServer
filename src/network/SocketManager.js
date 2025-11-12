@@ -1,6 +1,7 @@
 const { Server } = require('socket.io');
 const logger = require('../utils/logger');
 const MinionManager = require('../minions/minionManager');
+const { CLASS_DEFS, DEFAULT_CLASS_ID } = require('../data/classDefinitions');
 
 let io = null;
 
@@ -33,60 +34,6 @@ const DAMAGE_GROWTH_PER_LEVEL = 1.06;
 const SPEED_GROWTH_PER_LEVEL = 1.02;
 const KILL_XP_BASE = 240;
 const KILL_XP_PER_LEVEL = 35;
-
-const CLASS_DEFS = {
-  marksman: {
-    id: 'marksman',
-    label: 'Tireur',
-    stats: {
-      maxHp: 100,
-      moveSpeed: 4.5,
-      autoAttack: {
-        type: 'ranged',
-        damage: 5,
-        range: 4,
-        cooldownMs: 650,
-        projectileSpeed: 14,
-        projectileRadius: 0.6,
-        projectileTtl: 2.0
-      }
-    },
-    spells: {
-      Q: {
-        type: 'projectile',
-        damage: 10,
-        projectileSpeed: 25,
-        projectileRadius: 0.6,
-        projectileTtl: 0.3
-      }
-    }
-  },
-  melee: {
-    id: 'melee',
-    label: 'Mêlée',
-    stats: {
-      maxHp: 150,
-      moveSpeed: 4.5,
-      autoAttack: {
-        type: 'melee',
-        damage: 10,
-        range: 2.0,
-        cooldownMs: 1000,
-        projectileSpeed: 0,
-        projectileRadius: 1.0,
-        projectileTtl: 0
-      }
-    },
-    spells: {
-      Q: {
-        type: 'empower',
-        bonusDamage: 5
-      }
-    }
-  }
-};
-
-const DEFAULT_CLASS_ID = 'marksman';
 
 function clampLevel(level) {
   return Math.max(1, Math.min(level || 1, LEVEL_CAP));
