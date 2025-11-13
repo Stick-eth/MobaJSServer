@@ -110,7 +110,8 @@ const state = {
   waveCounts: {
     [TEAM_BLUE]: 0,
     [TEAM_RED]: 0
-  }
+  },
+  spawningEnabled: true
 };
 
 let ioRef = null;
@@ -552,6 +553,65 @@ function broadcastMinionProjectile(minion, target) {
     loggerRef?.netOut('minionProjectile', { to: 'all', data: payload });
   }
   ioRef.emit('minionProjectile', payload);
+}
+
+function sendSpawningStatus(targetSocket = null) {
+  const payload = { enabled: Boolean(state.spawningEnabled) };
+  if (targetSocket && typeof targetSocket.emit === 'function') {
+    targetSocket.emit('minionSpawningStatus', payload);
+  } else if (ioRef) {
+    ioRef.emit('minionSpawningStatus', payload);
+  }
+}
+
+function removeAllMinions(cause = 'disabled') {
+  const removals = [];
+  state.minions.forEach((minion) => {
+    removals.push({
+      id: minion.id,
+      team: minion.team,
+      lane: minion.lane,
+      type: minion.type,
+      cause,
+      killerId: null
+    });
+  });
+  state.minions.clear();
+  if (state.pendingRemovals.length) {
+    removals.push(...state.pendingRemovals.splice(0, state.pendingRemovals.length));
+  }
+  return removals;
+}
+
+function setSpawningEnabled(value, { source } = {}) {
+  const enabled = Boolean(value);
+  if (enabled === state.spawningEnabled) {
+    sendSpawningStatus();
+    return;
+  }
+
+  state.spawningEnabled = enabled;
+  state.waveTimer = 0;
+  state.broadcastTimer = 0;
+  state.firstWaveDelay = INITIAL_WAVE_DELAY_S;
+  state.waveCounts[TEAM_BLUE] = 0;
+  state.waveCounts[TEAM_RED] = 0;
+
+  if (!enabled) {
+    const removals = removeAllMinions('disabled');
+    if (removals.length) {
+      broadcastRemovals(removals);
+    }
+    loggerRef?.info('Minion spawning disabled', { source: source || null });
+  } else {
+    loggerRef?.info('Minion spawning enabled', { source: source || null });
+  }
+
+  sendSpawningStatus();
+}
+
+function isSpawningEnabled() {
+  return Boolean(state.spawningEnabled);
 }
 
 function applyDamageToMinion(attacker, target, amount) {
@@ -997,6 +1057,12 @@ function update(dt) {
     return;
   }
 
+  if (!state.spawningEnabled) {
+    state.waveTimer = 0;
+    state.broadcastTimer = 0;
+    return;
+  }
+
   if (state.firstWaveDelay > 0) {
     state.firstWaveDelay = Math.max(0, state.firstWaveDelay - dt);
     if (state.firstWaveDelay === 0) {
@@ -1047,6 +1113,7 @@ function handleConnection(socket) {
     return;
   }
   broadcastSnapshot(socket);
+  sendSpawningStatus(socket);
   socket.on('requestMinionSnapshot', () => {
     broadcastSnapshot(socket);
   });
@@ -1055,5 +1122,8 @@ function handleConnection(socket) {
 module.exports = {
   init,
   update,
-  handleConnection
+  handleConnection,
+  setSpawningEnabled,
+  isSpawningEnabled,
+  sendSpawningStatus
 };

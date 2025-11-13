@@ -493,6 +493,17 @@ module.exports = {
             targetId: targetId
           });
           applyDamage(targetId, damage, fromId, 'AA');
+
+      socket.on('setMinionSpawning', ({ enabled } = {}) => {
+        const normalized = Boolean(enabled);
+        logger.netIn('setMinionSpawning', { from: socket.id, data: { enabled: normalized } });
+        MinionManager.setSpawningEnabled(normalized, { source: socket.id });
+      });
+
+      socket.on('requestMinionSpawningStatus', () => {
+        logger.netIn('requestMinionSpawningStatus', { from: socket.id });
+        MinionManager.sendSpawningStatus(socket);
+      });
         } else {
           // Attaque à distance avec projectile (travel-time)
           const startX = from.x;
