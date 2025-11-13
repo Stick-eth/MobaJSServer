@@ -15,3 +15,6 @@
 npm install
 node server.js
 ```
+
+
+Sync version : 0.0.2
