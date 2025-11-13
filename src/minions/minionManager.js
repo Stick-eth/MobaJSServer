@@ -26,6 +26,10 @@ const PATH_STRAY_THRESHOLD = 4.5;
 const MINION_RETARGET_COOLDOWN = 0.5;
 const RETARGET_RANGE_MARGIN = 1.1;
 const MOVEMENT_SMOOTHING_RATE = 6;
+const PLAYER_TARGET_RADIUS = 0.45;
+const PLAYER_AGGRO_RADIUS = 4.5;
+const PLAYER_AGGRO_RADIUS_SQ = PLAYER_AGGRO_RADIUS * PLAYER_AGGRO_RADIUS;
+const PLAYER_DISENGAGE_BUFFER = 1.0;
 
 const PATH_LOOKAHEAD_PIXELS = 30;
 const MIN_LOOKAHEAD_WORLD = 1.5;
@@ -491,7 +495,9 @@ function serializeMinion(minion) {
     speed: round2(minion.speed || MINION_BASE_SPEED),
     hp: Math.max(0, Math.round(minion.hp ?? 0)),
     maxHp: Math.max(1, Math.round(minion.maxHp ?? 1)),
-    targetId: minion.targetId ?? null,
+    targetId: minion.target?.type === 'minion' ? minion.target.id : null,
+    targetPlayerId: minion.target?.type === 'player' ? minion.target.id : null,
+    targetType: minion.target?.type || null,
     arrived: Boolean(minion.arrived)
   };
 }
@@ -523,21 +529,29 @@ function broadcastRemovals(removals) {
   ioRef.emit('minionsRemoved', payload);
 }
 
-function broadcastMinionProjectile(minion, target) {
-  if (!ioRef || !minion || !target) {
+function broadcastMinionProjectile(minion, targetState) {
+  if (!ioRef || !minion || !targetState || !targetState.entity) {
     return;
   }
+  const targetEntity = targetState.entity;
+  const targetType = targetState.type;
   const projectileId = nextMinionProjectileId++;
   const origin = {
     x: round2(minion.position.x),
     y: round2(MINION_PROJECTILE_HEIGHT),
     z: round2(minion.position.z)
   };
-  const destination = {
-    x: round2(target.position.x),
-    y: round2(MINION_PROJECTILE_HEIGHT),
-    z: round2(target.position.z)
-  };
+  const destination = targetType === 'minion'
+    ? {
+        x: round2(targetEntity.position.x),
+        y: round2(MINION_PROJECTILE_HEIGHT),
+        z: round2(targetEntity.position.z)
+      }
+    : {
+        x: round2(targetEntity.x),
+        y: round2(MINION_PROJECTILE_HEIGHT),
+        z: round2(targetEntity.z)
+      };
   const speed = Math.max(1, minion.projectileSpeed || 12);
   const payload = {
     id: projectileId,
@@ -546,7 +560,8 @@ function broadcastMinionProjectile(minion, target) {
     type: minion.type,
     origin,
     destination,
-    targetId: target.id,
+    targetType,
+    targetId: targetEntity.id,
     speed
   };
   if (ENABLE_MINION_TRAFFIC_LOGS) {
@@ -614,7 +629,7 @@ function isSpawningEnabled() {
   return Boolean(state.spawningEnabled);
 }
 
-function applyDamageToMinion(attacker, target, amount) {
+function applyDamageToMinion(attacker, target, amount, { cause = 'combat', killerId = null } = {}) {
   if (!target || target.dead) {
     return false;
   }
@@ -624,7 +639,8 @@ function applyDamageToMinion(attacker, target, amount) {
   }
   target.hp = Math.max(0, (target.hp ?? target.maxHp) - damage);
   if (target.hp === 0) {
-    queueMinionRemoval(target, { cause: 'combat', killerId: attacker?.id || null });
+    const killer = killerId !== null ? killerId : (attacker?.id || null);
+    queueMinionRemoval(target, { cause, killerId: killer });
     return true;
   }
   return false;
@@ -703,6 +719,8 @@ function createMinion({ team, lane, type, path, baseDistance, lookAhead }) {
     projectileSpeed: typeDef.projectileSpeed || 0,
     retargetCooldown: 0,
     targetId: null,
+    targetPlayerId: null,
+    target: null,
     mode: 'path',
     arrived: path.totalLength > 0 && clamped >= path.totalLength - 0.05,
     dead: false
@@ -756,7 +774,7 @@ function limitVector(vec, maxLength) {
   return vec;
 }
 
-function advanceMinions(dt) {
+function advanceMinions(dt, playersMap = {}, damagePlayer) {
   if (!state.minions.size) {
     return;
   }
@@ -775,11 +793,13 @@ function advanceMinions(dt) {
     }
     if (minion.dead || minion.arrived) {
       minion.smoothedVelocity = null;
+      clearMinionTarget(minion);
+      return;
     }
-    if (minion.targetId) {
-      const target = state.minions.get(minion.targetId);
-      if (!target || target.dead || target.team === minion.team) {
-        minion.targetId = null;
+    const targetState = getMinionTargetState(minion, playersMap);
+    if (!targetState) {
+      clearMinionTarget(minion);
+      if (minion.mode === 'engage') {
         minion.mode = 'path';
       }
     }
@@ -791,50 +811,72 @@ function advanceMinions(dt) {
     }
     const detection = Math.max(minion.detectionRadius || 0, minion.attackRange || 0);
     const detectionSq = detection * detection;
-    const currentTarget = minion.targetId ? state.minions.get(minion.targetId) : null;
-    let target = (currentTarget && !currentTarget.dead) ? currentTarget : null;
-    let targetDistSq = Number.POSITIVE_INFINITY;
+    const playerAggro = Math.min(PLAYER_AGGRO_RADIUS, detection);
+    const playerAggroSq = Math.min(PLAYER_AGGRO_RADIUS_SQ, detectionSq);
 
-    if (target) {
-      targetDistSq = distanceSquared(minion.position.x, minion.position.z, target.position.x, target.position.z);
-      if (targetDistSq > detectionSq) {
-        target = null;
-      } else {
-        const attackReach = (minion.attackRange || 0) + minion.radius + (target.radius || MINION_RADIUS) * 0.5;
-        const maxRangeSq = attackReach * attackReach * RETARGET_RANGE_MARGIN;
-        if (targetDistSq > maxRangeSq && minion.retargetCooldown <= 0) {
-          target = null;
-        }
+    let targetState = getMinionTargetState(minion, playersMap);
+    if (targetState) {
+      const targetPos = targetState.type === 'minion'
+        ? targetState.entity.position
+        : { x: targetState.entity.x, z: targetState.entity.z };
+      const distSq = distanceSquared(minion.position.x, minion.position.z, targetPos.x, targetPos.z);
+      if (distSq > detectionSq) {
+        targetState = null;
       }
     }
 
-    if (!target && minion.retargetCooldown <= 0) {
-      let best = null;
-      let bestDistSq = Number.POSITIVE_INFINITY;
-      minionList.forEach(other => {
-        if (other === minion || other.dead || other.team === minion.team) {
-          return;
-        }
-        const distSq = distanceSquared(minion.position.x, minion.position.z, other.position.x, other.position.z);
-        if (distSq > detectionSq) {
-          return;
-        }
-        if (distSq < bestDistSq) {
-          best = other;
-          bestDistSq = distSq;
-        }
-      });
-      if (best) {
-        target = best;
-        minion.retargetCooldown = MINION_RETARGET_COOLDOWN;
+    let closestMinion = null;
+    let closestMinionDistSq = Number.POSITIVE_INFINITY;
+    minionList.forEach(other => {
+      if (other === minion || other.dead || other.team === minion.team) {
+        return;
       }
-    }
+      const distSq = distanceSquared(minion.position.x, minion.position.z, other.position.x, other.position.z);
+      if (distSq > detectionSq) {
+        return;
+      }
+      if (distSq < closestMinionDistSq) {
+        closestMinion = other;
+        closestMinionDistSq = distSq;
+      }
+    });
 
-    if (target) {
-      minion.targetId = target.id;
+    if (closestMinion) {
+      if (!targetState || targetState.type !== 'minion' || targetState.entity.id !== closestMinion.id) {
+        setMinionTarget(minion, { type: 'minion', id: closestMinion.id });
+      }
       minion.mode = 'engage';
+      minion.retargetCooldown = MINION_RETARGET_COOLDOWN;
+      return;
+    }
+
+    if (targetState && targetState.type === 'player') {
+      minion.mode = 'engage';
+      return;
+    }
+
+    let closestPlayer = null;
+    let closestPlayerDistSq = Number.POSITIVE_INFINITY;
+    Object.values(playersMap).forEach(player => {
+      if (!player || player.dead || !player.team || player.team === minion.team) {
+        return;
+      }
+      const distSq = distanceSquared(minion.position.x, minion.position.z, player.x, player.z);
+      if (distSq > playerAggroSq) {
+        return;
+      }
+      if (distSq < closestPlayerDistSq) {
+        closestPlayer = player;
+        closestPlayerDistSq = distSq;
+      }
+    });
+
+    if (closestPlayer) {
+      setMinionTarget(minion, { type: 'player', id: closestPlayer.id });
+      minion.mode = 'engage';
+      minion.retargetCooldown = MINION_RETARGET_COOLDOWN;
     } else {
-      minion.targetId = null;
+      clearMinionTarget(minion);
       minion.mode = 'path';
     }
   });
@@ -844,8 +886,10 @@ function advanceMinions(dt) {
       return;
     }
 
-    let target = minion.targetId ? state.minions.get(minion.targetId) : null;
-    let engaged = Boolean(target && !target.dead && minion.mode === 'engage');
+    const targetState = getMinionTargetState(minion, playersMap);
+    const targetEntity = targetState?.entity || null;
+    const targetType = targetState?.type || null;
+    let engaged = Boolean(targetEntity && minion.mode === 'engage');
 
     const pathProjection = minion.path.projectPoint(minion.position);
     if (pathProjection && Number.isFinite(pathProjection.distance)) {
@@ -855,10 +899,9 @@ function advanceMinions(dt) {
     let deviation = pathProjection ? Math.sqrt(pathProjection.dist2) : 0;
 
     if (deviation > PATH_STRAY_THRESHOLD) {
-      minion.targetId = null;
-      target = null;
-      minion.mode = 'path';
+      clearMinionTarget(minion);
       engaged = false;
+      minion.mode = 'path';
       minion.retargetCooldown = Math.max(minion.retargetCooldown, MINION_RETARGET_COOLDOWN * 0.5);
     }
 
@@ -869,8 +912,11 @@ function advanceMinions(dt) {
     const targetDistance = engaged
       ? minion.distance
       : minion.path.clampDistance(minion.distance + lookAhead);
-    const targetPoint = engaged && target
-      ? { x: target.position.x, z: target.position.z }
+
+    const targetPoint = (engaged && targetEntity)
+      ? (targetType === 'minion'
+        ? { x: targetEntity.position.x, z: targetEntity.position.z }
+        : { x: targetEntity.x, z: targetEntity.z })
       : minion.path.getPointAtDistance(targetDistance);
 
     let desiredDir = { x: 0, z: 1 };
@@ -882,10 +928,13 @@ function advanceMinions(dt) {
 
     const maxSpeed = minion.speed;
 
-    if (engaged && target) {
+    if (engaged && targetEntity) {
       const dist = toTargetLen || 0.0001;
       const norm = { x: toTarget.x / dist, z: toTarget.z / dist };
-      const effectiveRange = minion.attackRange + minion.radius + (target.radius || MINION_RADIUS) * 0.5;
+      const targetRadius = targetType === 'minion'
+        ? (targetEntity.radius || MINION_RADIUS)
+        : PLAYER_TARGET_RADIUS;
+      const effectiveRange = minion.attackRange + minion.radius + targetRadius * 0.5;
       const holdRange = minion.holdDistanceFactor > 0 ? effectiveRange * minion.holdDistanceFactor : 0;
 
       if (dist > effectiveRange * 0.92) {
@@ -895,7 +944,7 @@ function advanceMinions(dt) {
       } else {
         desiredDir = { x: 0, z: 0 };
       }
-      deviation = 0; // reduce correction pressure while fighting
+      deviation = 0;
     } else if (toTargetLen > 1e-4) {
       desiredDir = { x: toTarget.x / toTargetLen, z: toTarget.z / toTargetLen };
     } else {
@@ -1021,38 +1070,58 @@ function advanceMinions(dt) {
   });
 
   minionList.forEach(minion => {
-    if (minion.dead || minion.arrived || !minion.targetId) {
+    if (minion.dead || minion.arrived) {
       return;
     }
-    const target = state.minions.get(minion.targetId);
-    if (!target || target.dead) {
-      minion.targetId = null;
+    const targetState = getMinionTargetState(minion, playersMap);
+    if (!targetState) {
+      clearMinionTarget(minion);
       minion.mode = 'path';
       return;
     }
-    const dist = Math.hypot(target.position.x - minion.position.x, target.position.z - minion.position.z);
+    const targetEntity = targetState.entity;
+    const targetType = targetState.type;
+    if (!targetEntity || (targetType === 'player' && (targetEntity.dead || targetEntity.team === minion.team))) {
+      clearMinionTarget(minion);
+      minion.mode = 'path';
+      return;
+    }
+
+    const targetPos = targetType === 'minion'
+      ? targetEntity.position
+      : { x: targetEntity.x, z: targetEntity.z };
+    const dist = Math.hypot(targetPos.x - minion.position.x, targetPos.z - minion.position.z);
     const detection = Math.max(minion.detectionRadius || 0, minion.attackRange || 0);
+      const disengageRange = targetType === 'player' ? (minion.attackRange + 1) : (detection * 1.25);
     if (dist > detection * 1.25) {
-      minion.targetId = null;
+      clearMinionTarget(minion);
       minion.mode = 'path';
       return;
     }
-    const effectiveRange = minion.attackRange + minion.radius + (target.radius || MINION_RADIUS) * 0.5;
+
+    const targetRadius = targetType === 'minion'
+      ? (targetEntity.radius || MINION_RADIUS)
+      : PLAYER_TARGET_RADIUS;
+    const effectiveRange = minion.attackRange + minion.radius + targetRadius * 0.5;
     if (dist <= effectiveRange && (minion.attackTimer || 0) <= 0) {
       if (minion.type !== 'melee') {
-        broadcastMinionProjectile(minion, target);
+        broadcastMinionProjectile(minion, targetState);
       }
-      const killed = applyDamageToMinion(minion, target, minion.damage);
+      if (targetType === 'minion') {
+        const killed = applyDamageToMinion(minion, targetEntity, minion.damage, { cause: 'combat' });
+        if (killed) {
+          clearMinionTarget(minion);
+          minion.mode = 'path';
+        }
+      } else if (targetType === 'player' && typeof damagePlayer === 'function') {
+        damagePlayer(targetEntity.id, minion.damage, `minion:${minion.id}`, 'minion');
+      }
       minion.attackTimer = minion.attackInterval;
-      if (killed) {
-        minion.targetId = null;
-        minion.mode = 'path';
-      }
     }
   });
 }
 
-function update(dt) {
+function update(dt, context = {}) {
   if (!state.ready) {
     return;
   }
@@ -1076,7 +1145,10 @@ function update(dt) {
     }
   }
 
-  advanceMinions(dt);
+  const playersMap = context.players || {};
+  const damagePlayer = typeof context.damagePlayer === 'function' ? context.damagePlayer : null;
+
+  advanceMinions(dt, playersMap, damagePlayer);
 
   if (state.pendingRemovals.length) {
     const removals = state.pendingRemovals.splice(0, state.pendingRemovals.length);
@@ -1108,6 +1180,79 @@ async function init({ io, logger }) {
   }
 }
 
+function getMinionById(id) {
+  if (typeof id !== 'number') return null;
+  return state.minions.get(id) || null;
+}
+
+function forEachMinion(callback) {
+  if (typeof callback !== 'function') return;
+  state.minions.forEach((minion, id) => {
+    callback(minion, id);
+  });
+}
+
+function damageMinion(minionId, amount, { attackerId = null, cause = 'combat' } = {}) {
+  const minion = getMinionById(minionId);
+  if (!minion || minion.dead) {
+    return { ok: false, killed: false, hp: 0, maxHp: 0 };
+  }
+  const killed = applyDamageToMinion({ id: attackerId }, minion, amount, { cause, killerId: attackerId });
+  return {
+    ok: true,
+    killed,
+    hp: Math.max(0, minion.hp ?? 0),
+    maxHp: Math.max(1, minion.maxHp ?? 1)
+  };
+}
+
+function clearMinionTarget(minion) {
+  if (!minion) return;
+  minion.target = null;
+  minion.targetId = null;
+  minion.targetPlayerId = null;
+}
+
+function setMinionTarget(minion, target) {
+  if (!minion) return;
+  if (!target || !target.type || target.id === undefined || target.id === null) {
+    clearMinionTarget(minion);
+    return;
+  }
+  if (target.type === 'minion') {
+    minion.target = { type: 'minion', id: target.id };
+    minion.targetId = target.id;
+    minion.targetPlayerId = null;
+  } else if (target.type === 'player') {
+    minion.target = { type: 'player', id: target.id };
+    minion.targetPlayerId = target.id;
+    minion.targetId = null;
+  } else {
+    clearMinionTarget(minion);
+  }
+}
+
+function getMinionTargetState(minion, playersMap) {
+  if (!minion || !minion.target) {
+    return null;
+  }
+  if (minion.target.type === 'minion') {
+    const targetMinion = state.minions.get(minion.target.id);
+    if (targetMinion && !targetMinion.dead && targetMinion.team !== minion.team) {
+      return { type: 'minion', entity: targetMinion };
+    }
+    return null;
+  }
+  if (minion.target.type === 'player') {
+    if (!playersMap) return null;
+    const player = playersMap[minion.target.id];
+    if (player && !player.dead && player.team && player.team !== minion.team) {
+      return { type: 'player', entity: player };
+    }
+  }
+  return null;
+}
+
 function handleConnection(socket) {
   if (!state.ready || !socket) {
     return;
@@ -1125,5 +1270,8 @@ module.exports = {
   handleConnection,
   setSpawningEnabled,
   isSpawningEnabled,
-  sendSpawningStatus
+  sendSpawningStatus,
+  getMinionById,
+  forEachMinion,
+  damageMinion
 };

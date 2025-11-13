@@ -1,4 +1,7 @@
 const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
+const { PNG } = require('pngjs');
 const logger = require('../utils/logger');
 const MinionManager = require('../minions/minionManager');
 const { CLASS_DEFS, DEFAULT_CLASS_ID } = require('../data/classDefinitions');
@@ -16,6 +19,8 @@ let heartbeatInterval = null;
 let nextProjectileId = 1;
 let gameLoop = null;
 let lastTickAt = Date.now();
+const turrets = [];
+let turretsReady = false;
 
 const TEAM_BLUE = 'blue';
 const TEAM_RED = 'red';
@@ -34,6 +39,20 @@ const DAMAGE_GROWTH_PER_LEVEL = 1.06;
 const SPEED_GROWTH_PER_LEVEL = 1.02;
 const KILL_XP_BASE = 240;
 const KILL_XP_PER_LEVEL = 35;
+
+const TURRET_RADIUS = 5;
+const TURRET_ATTACK_INTERVAL = 1 / 0.8333;
+const TURRET_DAMAGE_PLAYER = 30;
+const TURRET_MINION_DAMAGE_RATIOS = {
+  melee: 0.45,
+  ranged: 0.7,
+  cannon: 0.14
+};
+const TURRET_PROJECTILE_SPEED = 22;
+const TURRET_PROJECTILE_HEIGHT = 2.8;
+const TERRAIN_SIZE = 100;
+const TURRET_MAP_ROOT = path.resolve(__dirname, '..', 'maps', 'base_map');
+const PLAYER_HP_REGEN_PER_SECOND = 1;
 
 function clampLevel(level) {
   return Math.max(1, Math.min(level || 1, LEVEL_CAP));
@@ -79,7 +98,8 @@ function createPlayerState(id) {
     xp: 0,
     xpToNext: xpRequiredForLevel(1),
     moveSpeed: 4.5,
-    baseStats: null
+    baseStats: null,
+    regenAccumulator: 0
   };
 }
 
@@ -112,6 +132,7 @@ function applyClassToPlayer(player, classId, { resetHp = false } = {}) {
   }
 
   player.nextAaBonus = 0;
+  player.regenAccumulator = player.regenAccumulator || 0;
   return classDef;
 }
 
@@ -289,6 +310,306 @@ function awardKillExperience(killerId, victim) {
   if (xpGain <= 0) return;
   addExperience(killer, xpGain);
 }
+function loadPngAsync(filePath) {
+  return new Promise((resolve, reject) => {
+    fs.createReadStream(filePath)
+      .pipe(new PNG({ filterType: 4 }))
+      .on('parsed', function parsed() { resolve(this); })
+      .on('error', reject);
+  });
+}
+
+function uvToWorld(u, v) {
+  const half = TERRAIN_SIZE * 0.5;
+  const x = (u - 0.5) * TERRAIN_SIZE;
+  const z = -(v - 0.5) * TERRAIN_SIZE;
+  return {
+    x: Math.max(-half, Math.min(x, half)),
+    z: Math.max(-half, Math.min(z, half))
+  };
+}
+
+async function loadTurretMarkersForTeam(team) {
+  const teamDir = path.join(TURRET_MAP_ROOT, team, 'turrets');
+  if (!fs.existsSync(teamDir)) {
+    logger.warn(`Turret directory missing for team ${team}: ${teamDir}`);
+    return [];
+  }
+
+  const entries = fs.readdirSync(teamDir).filter(name => name.toLowerCase().endsWith('.png'));
+  const results = [];
+
+  for (const filename of entries) {
+    const match = /^t_(\d+)_(\d+)\.png$/i.exec(filename);
+    if (!match) {
+      continue;
+    }
+    const lane = parseInt(match[1], 10);
+    const tier = parseInt(match[2], 10);
+    const id = `t_${lane}_${tier}`;
+    const filePath = path.join(teamDir, filename);
+    try {
+      const png = await loadPngAsync(filePath);
+      const { width, height, data } = png;
+      let sumX = 0;
+      let sumY = 0;
+      let count = 0;
+      for (let y = 0; y < height; y += 1) {
+        for (let x = 0; x < width; x += 1) {
+          const index = (y * width + x) * 4;
+          const alpha = data[index + 3];
+          if (alpha < 8) continue;
+          sumX += x + 0.5;
+          sumY += y + 0.5;
+          count += 1;
+        }
+      }
+      if (!count) {
+        logger.warn(`Turret marker empty: ${filePath}`);
+        continue;
+      }
+      const u = (sumX / count) / width;
+      const v = 1 - (sumY / count) / height;
+      const world = uvToWorld(u, v);
+      results.push({
+        uid: `${team}:${id}`,
+        id,
+        team,
+        lane,
+        tier,
+        x: world.x,
+        z: world.z
+      });
+    } catch (error) {
+      logger.error(`Failed to load turret marker ${filePath}`, { error: error.message });
+    }
+  }
+
+  return results;
+}
+
+async function loadTurrets() {
+  turrets.length = 0;
+  const blue = await loadTurretMarkersForTeam(TEAM_BLUE);
+  const red = await loadTurretMarkersForTeam(TEAM_RED);
+  [...blue, ...red].forEach(entry => {
+    turrets.push({
+      uid: entry.uid,
+      id: entry.id,
+      team: entry.team,
+      lane: entry.lane,
+      tier: entry.tier,
+      position: { x: entry.x, z: entry.z },
+      cooldown: Math.random() * TURRET_ATTACK_INTERVAL,
+      target: null
+    });
+  });
+  turretsReady = turrets.length > 0;
+  if (!turretsReady) {
+    logger.warn('No turret markers were loaded');
+  } else {
+    logger.info('Turrets loaded', { count: turrets.length });
+  }
+}
+
+function distanceSquared(ax, az, bx, bz) {
+  const dx = ax - bx;
+  const dz = az - bz;
+  return dx * dx + dz * dz;
+}
+
+function validateTurretTarget(turret) {
+  if (!turret || !turret.target) {
+    return null;
+  }
+  const radiusSq = TURRET_RADIUS * TURRET_RADIUS;
+  if (turret.target.type === 'minion') {
+    const minion = MinionManager.getMinionById(turret.target.id);
+    if (!minion || minion.dead || minion.team === turret.team) {
+      return null;
+    }
+    const distSq = distanceSquared(turret.position.x, turret.position.z, minion.position.x, minion.position.z);
+    if (distSq > radiusSq) return null;
+    return { type: 'minion', id: minion.id };
+  }
+  if (turret.target.type === 'player') {
+    const player = players[turret.target.id];
+    if (!player || player.dead || player.team === turret.team) {
+      return null;
+    }
+    const distSq = distanceSquared(turret.position.x, turret.position.z, player.x, player.z);
+    if (distSq > radiusSq) return null;
+    return { type: 'player', id: player.id };
+  }
+  return null;
+}
+
+function acquireTurretTarget(turret) {
+  const radiusSq = TURRET_RADIUS * TURRET_RADIUS;
+  const prioritizedMinions = {
+    cannon: null,
+    melee: null,
+    ranged: null
+  };
+  MinionManager.forEachMinion(minion => {
+    if (!minion || minion.dead || minion.team === turret.team) {
+      return;
+    }
+    const distSq = distanceSquared(turret.position.x, turret.position.z, minion.position.x, minion.position.z);
+    if (distSq > radiusSq) return;
+    const bucket = (minion.type === 'cannon') ? 'cannon' : (minion.type === 'melee' ? 'melee' : 'ranged');
+    const current = prioritizedMinions[bucket];
+    if (!current || distSq < current.distSq) {
+      prioritizedMinions[bucket] = { id: minion.id, distSq };
+    }
+  });
+  if (prioritizedMinions.cannon) {
+    return { type: 'minion', id: prioritizedMinions.cannon.id };
+  }
+  if (prioritizedMinions.melee) {
+    return { type: 'minion', id: prioritizedMinions.melee.id };
+  }
+  if (prioritizedMinions.ranged) {
+    return { type: 'minion', id: prioritizedMinions.ranged.id };
+  }
+
+  let bestPlayer = null;
+  Object.values(players).forEach(player => {
+    if (!player || player.dead || !player.team || player.team === turret.team) {
+      return;
+    }
+    const distSq = distanceSquared(turret.position.x, turret.position.z, player.x, player.z);
+    if (distSq > radiusSq) {
+      return;
+    }
+    if (!bestPlayer || distSq < bestPlayer.distSq) {
+      bestPlayer = { type: 'player', id: player.id, distSq };
+    }
+  });
+  if (bestPlayer) {
+    return { type: 'player', id: bestPlayer.id };
+  }
+  return null;
+}
+
+function broadcastTurretAttack(turret, targetPayload, targetState, extra = {}) {
+  if (!io || !turret || !targetPayload) {
+    return;
+  }
+  const origin = {
+    x: round2(turret.position.x),
+    y: round2(TURRET_PROJECTILE_HEIGHT),
+    z: round2(turret.position.z)
+  };
+  const targetX = round2(targetState?.position?.x ?? targetState?.x ?? 0);
+  const targetZ = round2(targetState?.position?.z ?? targetState?.z ?? 0);
+  const distance = Math.hypot(targetX - origin.x, targetZ - origin.z);
+  const travelTime = distance > 0 ? distance / TURRET_PROJECTILE_SPEED : 0;
+  const payload = {
+    turretId: turret.uid,
+    team: turret.team,
+    targetType: targetPayload.type,
+    targetId: targetPayload.id,
+    origin,
+    target: {
+      x: targetX,
+      y: round2(TURRET_PROJECTILE_HEIGHT),
+      z: targetZ
+    },
+    speed: TURRET_PROJECTILE_SPEED,
+    travelTime,
+    lane: turret.lane,
+    tier: turret.tier,
+    ...extra
+  };
+  io.emit('turretAttack', payload);
+}
+
+function fireTurret(turret) {
+  if (!turret || !turret.target) {
+    return;
+  }
+  if (turret.target.type === 'minion') {
+    const minion = MinionManager.getMinionById(turret.target.id);
+    if (!minion || minion.dead || minion.team === turret.team) {
+      turret.target = null;
+      return;
+    }
+    const ratio = TURRET_MINION_DAMAGE_RATIOS[minion.type] ?? 0.5;
+    const damage = Math.max(1, Math.round((minion.maxHp || 1) * ratio));
+    const result = MinionManager.damageMinion(minion.id, damage, { attackerId: turret.uid, cause: 'turret' });
+    broadcastTurretAttack(turret, turret.target, minion, { damage });
+    if (!result.ok || result.killed) {
+      turret.target = null;
+    }
+    return;
+  }
+  if (turret.target.type === 'player') {
+    const player = players[turret.target.id];
+    if (!player || player.dead || player.team === turret.team) {
+      turret.target = null;
+      return;
+    }
+    applyDamage(player.id, TURRET_DAMAGE_PLAYER, null, 'turret');
+    broadcastTurretAttack(turret, turret.target, player, { damage: TURRET_DAMAGE_PLAYER });
+    if (player.dead || player.hp <= 0) {
+      turret.target = null;
+    }
+  }
+}
+
+function updateTurrets(dt) {
+  if (!turretsReady || !turrets.length) {
+    return;
+  }
+  turrets.forEach(turret => {
+    turret.cooldown = Math.max(0, (turret.cooldown || 0) - dt);
+    const validated = validateTurretTarget(turret);
+    if (validated) {
+      turret.target = validated;
+    } else {
+      turret.target = null;
+    }
+    if (!turret.target) {
+      const candidate = acquireTurretTarget(turret);
+      if (candidate) {
+        turret.target = candidate;
+      }
+    }
+    if (turret.target && turret.cooldown <= 0) {
+      fireTurret(turret);
+      turret.cooldown = TURRET_ATTACK_INTERVAL;
+    }
+  });
+}
+
+function regeneratePlayers(dt) {
+  if (!io || dt <= 0) {
+    return;
+  }
+  const regenPerTick = PLAYER_HP_REGEN_PER_SECOND * dt;
+  if (regenPerTick <= 0) {
+    return;
+  }
+  Object.values(players).forEach(player => {
+    if (!player || player.dead) return;
+    if (typeof player.hp !== 'number' || typeof player.maxHp !== 'number') return;
+    if (player.hp >= player.maxHp) return;
+
+    const nextHp = Math.min(player.maxHp, Math.round((player.hp + regenPerTick) * 100) / 100);
+    if (nextHp <= player.hp) {
+      return;
+    }
+    player.hp = nextHp;
+    io.emit('playerHealthUpdate', {
+      id: player.id,
+      hp: player.hp,
+      maxHp: player.maxHp,
+      source: 'regen'
+    });
+  });
+}
+
 
 function ensureGameLoop() {
   if (gameLoop) return;
@@ -299,7 +620,12 @@ function ensureGameLoop() {
     lastTickAt = now;
     const dt = Math.min(Math.max(dtMs, 0) / 1000, 0.25);
     updateProjectiles(dt);
-    MinionManager.update(dt);
+    MinionManager.update(dt, {
+      players,
+      damagePlayer: applyDamage,
+    });
+    updateTurrets(dt);
+    regeneratePlayers(dt);
   }, TICK_MS);
 }
 
@@ -316,13 +642,24 @@ function updateProjectiles(dt) {
     const owner = players[p.ownerId];
     // homing: update direction toward current target position
     if (p.homing && p.targetId) {
-      const tgt = players[p.targetId];
-      if (tgt && !tgt.dead) {
-        const dirX = (tgt.x - p.x);
-        const dirZ = (tgt.z - p.z);
-        const d = Math.hypot(dirX, dirZ) || 0.0001;
-        p.dx = dirX / d;
-        p.dz = dirZ / d;
+      if (p.targetType === 'minion') {
+        const tgt = MinionManager.getMinionById(p.targetId);
+        if (tgt && !tgt.dead) {
+          const dirX = (tgt.position.x - p.x);
+          const dirZ = (tgt.position.z - p.z);
+          const d = Math.hypot(dirX, dirZ) || 0.0001;
+          p.dx = dirX / d;
+          p.dz = dirZ / d;
+        }
+      } else {
+        const tgt = players[p.targetId];
+        if (tgt && !tgt.dead) {
+          const dirX = (tgt.x - p.x);
+          const dirZ = (tgt.z - p.z);
+          const d = Math.hypot(dirX, dirZ) || 0.0001;
+          p.dx = dirX / d;
+          p.dz = dirZ / d;
+        }
       }
     }
     // avance
@@ -333,24 +670,46 @@ function updateProjectiles(dt) {
     // collision simple avec joueurs (cercle rayon p.radius)
     let hit = false;
     let hitTargetId = null;
-    for (const [id, pl] of Object.entries(players)) {
-      if (id === p.ownerId) continue; // pas soi-même
-      if (pl.dead) continue;
-      if (areAllies(pl, owner)) continue;
-      const dx = pl.x - p.x;
-      const dz = pl.z - p.z;
-      const dist2 = dx*dx + dz*dz;
-      if (dist2 <= p.radius * p.radius) {
-        applyDamage(id, p.damage ?? 5, p.ownerId, p.source || 'AA');
-        hitTargetId = id;
-        hit = true;
-        break;
+    let hitTargetType = null;
+
+    if (!hit && p.targetType !== 'player') {
+      MinionManager.forEachMinion((minion) => {
+        if (hit) return;
+        if (!minion || minion.dead) return;
+        if (p.ownerId && owner && minion.team === owner.team) return;
+        const dx = (minion.position.x ?? 0) - p.x;
+        const dz = (minion.position.z ?? 0) - p.z;
+        const dist2 = dx * dx + dz * dz;
+        if (dist2 <= p.radius * p.radius) {
+          MinionManager.damageMinion(minion.id, p.damage ?? 5, { attackerId: p.ownerId, cause: p.source || 'AA' });
+          hitTargetId = minion.id;
+          hitTargetType = 'minion';
+          hit = true;
+        }
+      });
+    }
+
+    if (!hit && p.targetType !== 'minion') {
+      for (const [id, pl] of Object.entries(players)) {
+        if (id === p.ownerId) continue; // pas soi-même
+        if (pl.dead) continue;
+        if (areAllies(pl, owner)) continue;
+        const dx = pl.x - p.x;
+        const dz = pl.z - p.z;
+        const dist2 = dx*dx + dz*dz;
+        if (dist2 <= p.radius * p.radius) {
+          applyDamage(id, p.damage ?? 5, p.ownerId, p.source || 'AA');
+          hitTargetId = id;
+          hitTargetType = 'player';
+          hit = true;
+          break;
+        }
       }
     }
 
     if (hit) {
       const impact = { x: round2(p.x), y: 0.5, z: round2(p.z) };
-      const msg = { id: p.id, ownerId: p.ownerId, targetId: hitTargetId, pos: impact };
+      const msg = { id: p.id, ownerId: p.ownerId, targetId: hitTargetId, targetType: hitTargetType, pos: impact };
       logger.netOut('projectileHit', { to: 'all', data: msg });
       io.emit('projectileHit', msg);
     }
@@ -434,6 +793,7 @@ module.exports = {
 
     MinionManager.init({ io, logger })
       .catch(error => logger.error('Minion manager init error', { error: error.message }));
+    loadTurrets().catch(error => logger.error('Turret load error', { error: error.message }));
     ensureGameLoop();
 
     // Avoid monkey-patching socket.io emit functions to prevent any side-effects on event loop
@@ -466,19 +826,37 @@ module.exports = {
         logger.netIn('autoattack', { from: socket.id, data });
         const fromId = socket.id;
         const targetId = data && data.targetId;
+        const requestedTargetType = typeof data?.targetType === 'string' ? data.targetType : null;
+        let targetType = requestedTargetType;
+        if (!targetType) {
+          targetType = typeof targetId === 'number' ? 'minion' : 'player';
+        }
+        targetType = targetType === 'minion' ? 'minion' : 'player';
         const from = players[fromId];
-        const target = players[targetId];
         if (!from || from.dead) return;
-        if (!target || target.dead) return;
-    if (areAllies(from, target)) return;
+        let targetPlayer = null;
+        let targetMinion = null;
+        if (targetType === 'player') {
+          targetPlayer = players[targetId];
+          if (!targetPlayer || targetPlayer.dead) return;
+          if (areAllies(from, targetPlayer)) return;
+        } else if (targetType === 'minion' && typeof targetId === 'number') {
+          targetMinion = MinionManager.getMinionById(targetId);
+          if (!targetMinion || targetMinion.dead || targetMinion.team === from.team) return;
+        } else {
+          return;
+        }
+
         const payloadPos = data && data.pos;
         if (payloadPos && typeof payloadPos.x === 'number' && typeof payloadPos.z === 'number') {
           from.x = round2(payloadPos.x);
           from.z = round2(payloadPos.z);
         }
         const range = from.aaRange || getClassDefinition(from.classId).stats.autoAttack.range;
-        const dx0 = (from.x ?? 0) - (target.x ?? 0);
-        const dz0 = (from.z ?? 0) - (target.z ?? 0);
+        const targetXBase = targetType === 'player' ? (targetPlayer?.x ?? 0) : (targetMinion?.position?.x ?? 0);
+        const targetZBase = targetType === 'player' ? (targetPlayer?.z ?? 0) : (targetMinion?.position?.z ?? 0);
+        const dx0 = (from.x ?? 0) - targetXBase;
+        const dz0 = (from.z ?? 0) - targetZBase;
         const dist2 = dx0*dx0 + dz0*dz0;
         if (dist2 > range * range) return; // hors portée
 
@@ -490,9 +868,14 @@ module.exports = {
           io.emit('autoattack', {
             type: 'melee',
             from: fromId,
+            targetType,
             targetId: targetId
           });
-          applyDamage(targetId, damage, fromId, 'AA');
+          if (targetType === 'player') {
+            applyDamage(targetId, damage, fromId, 'AA');
+          } else {
+            MinionManager.damageMinion(targetId, damage, { attackerId: fromId, cause: 'player-aa' });
+          }
 
       socket.on('setMinionSpawning', ({ enabled } = {}) => {
         const normalized = Boolean(enabled);
@@ -508,8 +891,8 @@ module.exports = {
           // Attaque à distance avec projectile (travel-time)
           const startX = from.x;
           const startZ = from.z;
-          const targetX = target.x;
-          const targetZ = target.z;
+          const targetX = targetType === 'player' ? targetPlayer.x : targetMinion.position.x;
+          const targetZ = targetType === 'player' ? targetPlayer.z : targetMinion.position.z;
           const dirX = targetX - startX;
           const dirZ = targetZ - startZ;
           const dist = Math.hypot(dirX, dirZ) || 0.0001;
@@ -523,6 +906,7 @@ module.exports = {
           const payload = {
             type: 'ranged',
             from: fromId,
+            targetType,
             targetId: targetId,
             pos: { x: startX, y: 0.5, z: startZ },
             dir: { x: nx, y: 0, z: nz },
@@ -545,6 +929,7 @@ module.exports = {
             radius: from.aaRadius || 0.6,
             ttl,
             targetId,
+            targetType,
             homing: true,
             damage,
             source: 'AA'

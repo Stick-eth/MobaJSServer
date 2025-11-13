@@ -3,11 +3,11 @@ const CLASS_DEFS = {
     id: 'marksman',
     label: 'Tireur',
     stats: {
-      maxHp: 100,
+      maxHp: 1200,
       moveSpeed: 4.5,
       autoAttack: {
         type: 'ranged',
-        damage: 5,
+        damage: 55,
         range: 4,
         cooldownMs: 650,
         projectileSpeed: 14,
@@ -18,7 +18,7 @@ const CLASS_DEFS = {
     spells: {
       Q: {
         type: 'projectile',
-        damage: 10,
+        damage: 140,
         projectileSpeed: 25,
         projectileRadius: 0.6,
         projectileTtl: 0.3
@@ -29,12 +29,12 @@ const CLASS_DEFS = {
     id: 'melee',
     label: 'M\u00eal\u00e9e',
     stats: {
-      maxHp: 150,
+      maxHp: 1200,
       moveSpeed: 4.5,
       autoAttack: {
         type: 'melee',
-        damage: 10,
-        range: 2.0,
+        damage: 85,
+        range: 1.0,
         cooldownMs: 1000,
         projectileSpeed: 0,
         projectileRadius: 1.0,
@@ -44,7 +44,7 @@ const CLASS_DEFS = {
     spells: {
       Q: {
         type: 'empower',
-        bonusDamage: 5
+        bonusDamage: 160
       }
     }
   }
