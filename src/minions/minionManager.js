@@ -62,7 +62,7 @@ const MINION_TYPES = {
     id: 'melee',
     maxHp: 480,
     damage: 12,
-    attackRange: (PLAYER_MELEE_ATTACK_RANGE * 0.35 + 0.15) * 1.5 * 1.25,
+    attackRange: (PLAYER_MELEE_ATTACK_RANGE * 0.35 + 0.15) * 1.75,
     detectionRadius: BASE_VISION_RADIUS,
     attackInterval: 0.8,
     speedMultiplier: 1.0,
