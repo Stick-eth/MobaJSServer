@@ -18,7 +18,7 @@ const CLASS_DEFS = {
     spells: {
       Q: {
         type: 'projectile',
-        damage: 140,
+        damage: 280,
         projectileSpeed: 25,
         projectileRadius: 0.6,
         projectileTtl: 0.3

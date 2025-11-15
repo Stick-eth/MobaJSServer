@@ -27,7 +27,7 @@ const MINION_RETARGET_COOLDOWN = 0.5;
 const RETARGET_RANGE_MARGIN = 1.1;
 const MOVEMENT_SMOOTHING_RATE = 6;
 const PLAYER_TARGET_RADIUS = 0.45;
-const PLAYER_AGGRO_RADIUS = 4.5;
+const PLAYER_AGGRO_RADIUS = 4.2;
 const PLAYER_AGGRO_RADIUS_SQ = PLAYER_AGGRO_RADIUS * PLAYER_AGGRO_RADIUS;
 const PLAYER_DISENGAGE_BUFFER = 1.0;
 
@@ -41,7 +41,7 @@ const ENEMY_SEPARATION_DISTANCE = MINION_RADIUS * 2.8;
 const ALLY_SEPARATION_WEIGHT = 6.75;
 const ENEMY_SEPARATION_WEIGHT = 9.5;
 
-const BASE_VISION_RADIUS = PLAYER_RANGED_ATTACK_RANGE * 2;
+const BASE_VISION_RADIUS = PLAYER_RANGED_ATTACK_RANGE * 1.5;
 const ENABLE_MINION_TRAFFIC_LOGS = false;
 
 const STUCK_SPEED_THRESHOLD = 0.25;
@@ -51,12 +51,17 @@ const STUCK_SIDE_FORCE = 6;
 const CANNON_WAVE_FREQUENCY = 3;
 const CANNON_INSERT_INDEX = 3;
 
+const TURRET_TARGET_RADIUS = 1.4;
+
+const WALKABLE_MAP_FILE = 'heightmap.png';
+const WALKABLE_CLEARANCE_SAMPLES = 16;
+
 const MINION_TYPES = {
   melee: {
     id: 'melee',
     maxHp: 480,
     damage: 12,
-    attackRange: PLAYER_MELEE_ATTACK_RANGE * 0.35,
+    attackRange: PLAYER_MELEE_ATTACK_RANGE * 0.35 + 0.15,
     detectionRadius: BASE_VISION_RADIUS,
     attackInterval: 0.8,
     speedMultiplier: 1.0,
@@ -93,6 +98,12 @@ const DEFAULT_MINION_TYPE = 'melee';
 const BASE_WAVE_COMPOSITION = ['melee', 'melee', 'melee', 'ranged', 'ranged', 'ranged'];
 
 const MAP_ROOT = path.resolve(__dirname, '..', 'maps', 'base_map');
+
+const walkableMap = {
+  width: 0,
+  height: 0,
+  data: null
+};
 
 const DIRECTIONS = [
   [1, 0], [-1, 0], [0, 1], [0, -1],
@@ -482,6 +493,64 @@ async function loadAllLanes() {
   });
 }
 
+async function loadWalkableMap() {
+  const mapPath = path.join(MAP_ROOT, WALKABLE_MAP_FILE);
+  if (!fs.existsSync(mapPath)) {
+    throw new Error(`Walkable map texture missing: ${mapPath}`);
+  }
+  const png = await loadPng(mapPath);
+  walkableMap.width = png.width;
+  walkableMap.height = png.height;
+  walkableMap.data = Buffer.from(png.data);
+}
+
+function worldToWalkablePixel(x, z) {
+  const { width, height } = walkableMap;
+  if (!width || !height) {
+    return { u: -1, v: -1 };
+  }
+  const half = TERRAIN_SIZE * 0.5;
+  const u = Math.floor(((x + half) / TERRAIN_SIZE) * width);
+  const v = Math.floor(((z + half) / TERRAIN_SIZE) * height);
+  return { u, v };
+}
+
+function isPixelWalkable(u, v) {
+  const { width, height, data } = walkableMap;
+  if (!data || width <= 0 || height <= 0) {
+    return true;
+  }
+  if (u < 0 || v < 0 || u >= width || v >= height) {
+    return false;
+  }
+  const idx = (v * width + u) * 4;
+  const value = data[idx];
+  return value === 0;
+}
+
+function isWalkableWorld(x, z) {
+  const { u, v } = worldToWalkablePixel(x, z);
+  return isPixelWalkable(u, v);
+}
+
+function isWalkableWithClearance(x, z, clearance = 0) {
+  if (!isWalkableWorld(x, z)) {
+    return false;
+  }
+  if (!clearance || clearance <= 0) {
+    return true;
+  }
+  for (let i = 0; i < WALKABLE_CLEARANCE_SAMPLES; i += 1) {
+    const angle = (i / WALKABLE_CLEARANCE_SAMPLES) * Math.PI * 2;
+    const offsetX = Math.cos(angle) * clearance;
+    const offsetZ = Math.sin(angle) * clearance;
+    if (!isWalkableWorld(x + offsetX, z + offsetZ)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function serializeMinion(minion) {
   return {
     id: minion.id,
@@ -547,12 +616,21 @@ function broadcastMinionProjectile(minion, targetState) {
         y: round2(MINION_PROJECTILE_HEIGHT),
         z: round2(targetEntity.position.z)
       }
-    : {
-        x: round2(targetEntity.x),
-        y: round2(MINION_PROJECTILE_HEIGHT),
-        z: round2(targetEntity.z)
-      };
-  const speed = Math.max(1, minion.projectileSpeed || 12);
+    : targetType === 'turret'
+      ? {
+          x: round2(targetEntity.position.x),
+          y: round2(2.4),
+          z: round2(targetEntity.position.z)
+        }
+      : {
+          x: round2(targetEntity.x),
+          y: round2(MINION_PROJECTILE_HEIGHT),
+          z: round2(targetEntity.z)
+        };
+  const baseSpeed = Math.max(1, minion.projectileSpeed || 12);
+  const speed = targetType === 'turret'
+    ? Math.max(2, baseSpeed * 0.55)
+    : baseSpeed;
   const payload = {
     id: projectileId,
     fromId: minion.id,
@@ -561,7 +639,7 @@ function broadcastMinionProjectile(minion, targetState) {
     origin,
     destination,
     targetType,
-    targetId: targetEntity.id,
+    targetId: targetType === 'turret' ? targetEntity.uid : targetEntity.id,
     speed
   };
   if (ENABLE_MINION_TRAFFIC_LOGS) {
@@ -720,10 +798,12 @@ function createMinion({ team, lane, type, path, baseDistance, lookAhead }) {
     retargetCooldown: 0,
     targetId: null,
     targetPlayerId: null,
+  targetTurretId: null,
     target: null,
     mode: 'path',
     arrived: path.totalLength > 0 && clamped >= path.totalLength - 0.05,
-    dead: false
+    dead: false,
+    anchored: false
   };
 }
 
@@ -774,10 +854,23 @@ function limitVector(vec, maxLength) {
   return vec;
 }
 
-function advanceMinions(dt, playersMap = {}, damagePlayer) {
+function advanceMinions(dt, playersMap = {}, damagePlayer, extra = {}) {
   if (!state.minions.size) {
     return;
   }
+
+  const damageTurretFn = typeof extra.damageTurret === 'function' ? extra.damageTurret : null;
+  const getTurretsForTeamFn = typeof extra.getAttackableTurretsForTeam === 'function'
+    ? extra.getAttackableTurretsForTeam
+    : null;
+  const turretStateLookup = typeof extra.getTurretState === 'function' ? extra.getTurretState : null;
+
+  const attackableTurretsCache = getTurretsForTeamFn
+    ? {
+        [TEAM_BLUE]: getTurretsForTeamFn(TEAM_BLUE) || [],
+        [TEAM_RED]: getTurretsForTeamFn(TEAM_RED) || []
+      }
+    : null;
 
   const minionList = Array.from(state.minions.values());
 
@@ -796,7 +889,7 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
       clearMinionTarget(minion);
       return;
     }
-    const targetState = getMinionTargetState(minion, playersMap);
+    const targetState = getMinionTargetState(minion, playersMap, turretStateLookup);
     if (!targetState) {
       clearMinionTarget(minion);
       if (minion.mode === 'engage') {
@@ -814,15 +907,40 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
     const playerAggro = Math.min(PLAYER_AGGRO_RADIUS, detection);
     const playerAggroSq = Math.min(PLAYER_AGGRO_RADIUS_SQ, detectionSq);
 
-    let targetState = getMinionTargetState(minion, playersMap);
+    let targetState = getMinionTargetState(minion, playersMap, turretStateLookup);
     if (targetState) {
       const targetPos = targetState.type === 'minion'
         ? targetState.entity.position
-        : { x: targetState.entity.x, z: targetState.entity.z };
+        : targetState.type === 'player'
+          ? { x: targetState.entity.x, z: targetState.entity.z }
+          : targetState.entity.position;
       const distSq = distanceSquared(minion.position.x, minion.position.z, targetPos.x, targetPos.z);
       if (distSq > detectionSq) {
         targetState = null;
       }
+    }
+
+    let closestTurret = null;
+    if (attackableTurretsCache) {
+      const available = attackableTurretsCache[minion.team] || [];
+      available.forEach(turret => {
+        const distSq = distanceSquared(minion.position.x, minion.position.z, turret.position.x, turret.position.z);
+        if (distSq > detectionSq) {
+          return;
+        }
+        if (!closestTurret || distSq < closestTurret.distSq) {
+          closestTurret = { turret, distSq };
+        }
+      });
+    }
+
+    if (closestTurret) {
+      if (!targetState || targetState.type !== 'turret' || targetState.entity.uid !== closestTurret.turret.uid) {
+        setMinionTarget(minion, { type: 'turret', id: closestTurret.turret.uid });
+      }
+      minion.mode = 'engage';
+      minion.retargetCooldown = MINION_RETARGET_COOLDOWN;
+      return;
     }
 
     let closestMinion = null;
@@ -850,7 +968,7 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
       return;
     }
 
-    if (targetState && targetState.type === 'player') {
+    if (targetState && (targetState.type === 'player' || targetState.type === 'turret')) {
       minion.mode = 'engage';
       return;
     }
@@ -886,10 +1004,11 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
       return;
     }
 
-    const targetState = getMinionTargetState(minion, playersMap);
+    const targetState = getMinionTargetState(minion, playersMap, turretStateLookup);
     const targetEntity = targetState?.entity || null;
     const targetType = targetState?.type || null;
     let engaged = Boolean(targetEntity && minion.mode === 'engage');
+    const selfRadius = minion.radius || MINION_RADIUS;
 
     const pathProjection = minion.path.projectPoint(minion.position);
     if (pathProjection && Number.isFinite(pathProjection.distance)) {
@@ -916,7 +1035,9 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
     const targetPoint = (engaged && targetEntity)
       ? (targetType === 'minion'
         ? { x: targetEntity.position.x, z: targetEntity.position.z }
-        : { x: targetEntity.x, z: targetEntity.z })
+        : targetType === 'player'
+          ? { x: targetEntity.x, z: targetEntity.z }
+          : { x: targetEntity.position.x, z: targetEntity.position.z })
       : minion.path.getPointAtDistance(targetDistance);
 
     let desiredDir = { x: 0, z: 1 };
@@ -925,17 +1046,27 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
       z: targetPoint.z - minion.position.z
     };
     const toTargetLen = Math.hypot(toTarget.x, toTarget.z);
+    const targetRadius = targetType === 'minion'
+      ? (targetEntity?.radius || MINION_RADIUS)
+      : targetType === 'player'
+        ? PLAYER_TARGET_RADIUS
+        : (targetEntity?.radius || TURRET_TARGET_RADIUS);
+    const effectiveRange = engaged && targetEntity
+      ? minion.attackRange + selfRadius + targetRadius * 0.5
+      : 0;
+    const anchoredInCombat = engaged && targetEntity
+      ? toTargetLen <= Math.max(effectiveRange * 0.98, selfRadius * 1.1)
+      : false;
+    minion.anchored = anchoredInCombat;
 
     const maxSpeed = minion.speed;
 
     if (engaged && targetEntity) {
       const dist = toTargetLen || 0.0001;
       const norm = { x: toTarget.x / dist, z: toTarget.z / dist };
-      const targetRadius = targetType === 'minion'
-        ? (targetEntity.radius || MINION_RADIUS)
-        : PLAYER_TARGET_RADIUS;
-      const effectiveRange = minion.attackRange + minion.radius + targetRadius * 0.5;
-      const holdRange = minion.holdDistanceFactor > 0 ? effectiveRange * minion.holdDistanceFactor : 0;
+      const holdRange = (minion.holdDistanceFactor > 0 && effectiveRange > 0)
+        ? effectiveRange * minion.holdDistanceFactor
+        : 0;
 
       if (dist > effectiveRange * 0.92) {
         desiredDir = norm;
@@ -997,17 +1128,24 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
       if (dist <= 1e-5) {
         return;
       }
-      const baseGap = minion.radius + (other.radius || MINION_RADIUS) + 0.1;
-      const desiredGap = other.team === minion.team ? ALLY_SEPARATION_DISTANCE : ENEMY_SEPARATION_DISTANCE;
-      const range = Math.max(desiredGap, baseGap);
+      const otherRadius = other.radius || MINION_RADIUS;
+      const baseGap = selfRadius + otherRadius + 0.1;
+      let desiredGap = other.team === minion.team ? ALLY_SEPARATION_DISTANCE : ENEMY_SEPARATION_DISTANCE;
       if (other.team !== minion.team && dist < closestEnemy) {
         closestEnemy = dist;
       }
+      if (other.team !== minion.team && (minion.anchored || other.anchored)) {
+        desiredGap = baseGap;
+      }
+      const range = Math.max(desiredGap, baseGap);
       if (dist >= range) {
         return;
       }
       const overlap = range - dist;
-      const weight = other.team === minion.team ? ALLY_SEPARATION_WEIGHT : ENEMY_SEPARATION_WEIGHT;
+      let weight = other.team === minion.team ? ALLY_SEPARATION_WEIGHT : ENEMY_SEPARATION_WEIGHT;
+      if (other.team !== minion.team && (minion.anchored || other.anchored)) {
+        weight *= (minion.anchored && other.anchored) ? 0.05 : 0.2;
+      }
       const pushStrength = weight * (overlap / range);
       force.x += (dx / dist) * pushStrength;
       force.z += (dz / dist) * pushStrength;
@@ -1042,11 +1180,37 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
       minion.velocity.z *= clampScale;
     }
 
-    minion.position.x += minion.velocity.x * dt;
-    minion.position.z += minion.velocity.z * dt;
     const halfSize = TERRAIN_SIZE * 0.5;
-    minion.position.x = clamp(minion.position.x, -halfSize, halfSize);
-    minion.position.z = clamp(minion.position.z, -halfSize, halfSize);
+    const prevX = minion.position.x;
+    const prevZ = minion.position.z;
+    let nextX = clamp(prevX + minion.velocity.x * dt, -halfSize, halfSize);
+    let nextZ = clamp(prevZ + minion.velocity.z * dt, -halfSize, halfSize);
+    if (!isWalkableWithClearance(nextX, nextZ, selfRadius)) {
+      const canMoveX = isWalkableWithClearance(nextX, prevZ, selfRadius);
+      const canMoveZ = isWalkableWithClearance(prevX, nextZ, selfRadius);
+      if (canMoveX && !canMoveZ) {
+        nextZ = prevZ;
+        minion.velocity.z = 0;
+      } else if (!canMoveX && canMoveZ) {
+        nextX = prevX;
+        minion.velocity.x = 0;
+      } else if (canMoveX && canMoveZ) {
+        if (Math.abs(nextX - prevX) > Math.abs(nextZ - prevZ)) {
+          nextX = prevX;
+          minion.velocity.x = 0;
+        } else {
+          nextZ = prevZ;
+          minion.velocity.z = 0;
+        }
+      } else {
+        nextX = prevX;
+        nextZ = prevZ;
+        minion.velocity.x = 0;
+        minion.velocity.z = 0;
+      }
+    }
+    minion.position.x = nextX;
+    minion.position.z = nextZ;
 
     const updatedProjection = minion.path.projectPoint(minion.position);
     if (updatedProjection) {
@@ -1073,7 +1237,7 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
     if (minion.dead || minion.arrived) {
       return;
     }
-    const targetState = getMinionTargetState(minion, playersMap);
+    const targetState = getMinionTargetState(minion, playersMap, turretStateLookup);
     if (!targetState) {
       clearMinionTarget(minion);
       minion.mode = 'path';
@@ -1089,11 +1253,17 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
 
     const targetPos = targetType === 'minion'
       ? targetEntity.position
-      : { x: targetEntity.x, z: targetEntity.z };
+      : targetType === 'player'
+        ? { x: targetEntity.x, z: targetEntity.z }
+        : targetType === 'turret' && targetEntity.position
+          ? targetEntity.position
+          : { x: targetEntity.position?.x ?? targetEntity.x, z: targetEntity.position?.z ?? targetEntity.z };
     const dist = Math.hypot(targetPos.x - minion.position.x, targetPos.z - minion.position.z);
     const detection = Math.max(minion.detectionRadius || 0, minion.attackRange || 0);
-      const disengageRange = targetType === 'player' ? (minion.attackRange + 1) : (detection * 1.25);
-    if (dist > detection * 1.25) {
+    const disengageRange = targetType === 'player'
+      ? Math.max(minion.attackRange + PLAYER_DISENGAGE_BUFFER, detection)
+      : detection;
+    if (dist > disengageRange) {
       clearMinionTarget(minion);
       minion.mode = 'path';
       return;
@@ -1101,11 +1271,35 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
 
     const targetRadius = targetType === 'minion'
       ? (targetEntity.radius || MINION_RADIUS)
-      : PLAYER_TARGET_RADIUS;
+      : targetType === 'turret'
+        ? (targetEntity.radius || TURRET_TARGET_RADIUS)
+        : PLAYER_TARGET_RADIUS;
     const effectiveRange = minion.attackRange + minion.radius + targetRadius * 0.5;
     if (dist <= effectiveRange && (minion.attackTimer || 0) <= 0) {
       if (minion.type !== 'melee') {
-        broadcastMinionProjectile(minion, targetState);
+        if (targetType === 'turret') {
+          broadcastMinionProjectile(minion, {
+            type: 'turret',
+            entity: {
+              uid: targetEntity.uid,
+              team: targetEntity.team,
+              position: targetEntity.position,
+              radius: targetEntity.radius
+            }
+          });
+        } else if (targetType === 'player') {
+          broadcastMinionProjectile(minion, {
+            type: 'player',
+            entity: {
+              id: targetEntity.id,
+              x: targetEntity.x,
+              z: targetEntity.z,
+              team: targetEntity.team
+            }
+          });
+        } else {
+          broadcastMinionProjectile(minion, targetState);
+        }
       }
       if (targetType === 'minion') {
         const killed = applyDamageToMinion(minion, targetEntity, minion.damage, { cause: 'combat' });
@@ -1115,6 +1309,15 @@ function advanceMinions(dt, playersMap = {}, damagePlayer) {
         }
       } else if (targetType === 'player' && typeof damagePlayer === 'function') {
         damagePlayer(targetEntity.id, minion.damage, `minion:${minion.id}`, 'minion');
+      } else if (targetType === 'turret' && typeof damageTurretFn === 'function') {
+        const result = damageTurretFn(targetEntity.uid || minion.target?.id, minion.damage, {
+          attackerId: minion.id,
+          source: 'minion'
+        });
+        if (result?.destroyed) {
+          clearMinionTarget(minion);
+          minion.mode = 'path';
+        }
       }
       minion.attackTimer = minion.attackInterval;
     }
@@ -1148,7 +1351,13 @@ function update(dt, context = {}) {
   const playersMap = context.players || {};
   const damagePlayer = typeof context.damagePlayer === 'function' ? context.damagePlayer : null;
 
-  advanceMinions(dt, playersMap, damagePlayer);
+  advanceMinions(dt, playersMap, damagePlayer, {
+    damageTurret: typeof context.damageTurret === 'function' ? context.damageTurret : null,
+    getAttackableTurretsForTeam: typeof context.getAttackableTurretsForTeam === 'function'
+      ? context.getAttackableTurretsForTeam
+      : null,
+    getTurretState: typeof context.getTurretState === 'function' ? context.getTurretState : null
+  });
 
   if (state.pendingRemovals.length) {
     const removals = state.pendingRemovals.splice(0, state.pendingRemovals.length);
@@ -1166,7 +1375,10 @@ async function init({ io, logger }) {
   ioRef = io;
   loggerRef = logger;
   try {
-    await loadAllLanes();
+    await Promise.all([
+      loadAllLanes(),
+      loadWalkableMap()
+    ]);
     state.ready = true;
     loggerRef?.info('Minion manager ready', {
       lanes: {
@@ -1211,6 +1423,7 @@ function clearMinionTarget(minion) {
   minion.target = null;
   minion.targetId = null;
   minion.targetPlayerId = null;
+  minion.targetTurretId = null;
 }
 
 function setMinionTarget(minion, target) {
@@ -1223,16 +1436,23 @@ function setMinionTarget(minion, target) {
     minion.target = { type: 'minion', id: target.id };
     minion.targetId = target.id;
     minion.targetPlayerId = null;
+    minion.targetTurretId = null;
   } else if (target.type === 'player') {
     minion.target = { type: 'player', id: target.id };
     minion.targetPlayerId = target.id;
     minion.targetId = null;
+    minion.targetTurretId = null;
+  } else if (target.type === 'turret') {
+    minion.target = { type: 'turret', id: target.id };
+    minion.targetTurretId = target.id;
+    minion.targetId = null;
+    minion.targetPlayerId = null;
   } else {
     clearMinionTarget(minion);
   }
 }
 
-function getMinionTargetState(minion, playersMap) {
+function getMinionTargetState(minion, playersMap, turretStateGetter) {
   if (!minion || !minion.target) {
     return null;
   }
@@ -1249,6 +1469,26 @@ function getMinionTargetState(minion, playersMap) {
     if (player && !player.dead && player.team && player.team !== minion.team) {
       return { type: 'player', entity: player };
     }
+  }
+  if (minion.target.type === 'turret') {
+    if (typeof turretStateGetter !== 'function') {
+      return null;
+    }
+    const turret = turretStateGetter(minion.target.id);
+    if (turret && !turret.destroyed && turret.team !== minion.team && turret.attackable) {
+      return {
+        type: 'turret',
+        entity: {
+          uid: turret.uid,
+          team: turret.team,
+          position: { x: turret.position.x, z: turret.position.z },
+          radius: turret.hitRadius || TURRET_TARGET_RADIUS,
+          hp: turret.hp,
+          maxHp: turret.maxHp
+        }
+      };
+    }
+    return null;
   }
   return null;
 }

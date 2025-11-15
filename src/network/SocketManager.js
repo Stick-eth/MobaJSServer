@@ -53,6 +53,37 @@ const TURRET_PROJECTILE_HEIGHT = 2.8;
 const TERRAIN_SIZE = 100;
 const TURRET_MAP_ROOT = path.resolve(__dirname, '..', 'maps', 'base_map');
 const PLAYER_HP_REGEN_PER_SECOND = 1;
+const TURRET_BASE_HP = 3200;
+const TURRET_TIER_HP_BONUS = 350;
+const TURRET_HIT_RADIUS = 1.4;
+const DEFAULT_PLAYER_TARGET_RADIUS = 0.45;
+const DEFAULT_MINION_TARGET_RADIUS = 0.5;
+
+const turretByUid = new Map();
+const turretsByLane = new Map();
+
+function computeTurretMaxHp(tier = 1) {
+  const parsedTier = Math.max(1, Number.isFinite(tier) ? Math.floor(tier) : 1);
+  return TURRET_BASE_HP + (parsedTier - 1) * TURRET_TIER_HP_BONUS;
+}
+
+function getLaneKey(team, lane) {
+  return `${team}:${lane}`;
+}
+
+function ensureLaneBucket(team, lane) {
+  const key = getLaneKey(team, lane);
+  if (!turretsByLane.has(key)) {
+    turretsByLane.set(key, []);
+  }
+  return turretsByLane.get(key);
+}
+
+function getEnemyTeam(team) {
+  if (team === TEAM_BLUE) return TEAM_RED;
+  if (team === TEAM_RED) return TEAM_BLUE;
+  return null;
+}
 
 function clampLevel(level) {
   return Math.max(1, Math.min(level || 1, LEVEL_CAP));
@@ -390,10 +421,13 @@ async function loadTurretMarkersForTeam(team) {
 
 async function loadTurrets() {
   turrets.length = 0;
+  turretByUid.clear();
+  turretsByLane.clear();
   const blue = await loadTurretMarkersForTeam(TEAM_BLUE);
   const red = await loadTurretMarkersForTeam(TEAM_RED);
   [...blue, ...red].forEach(entry => {
-    turrets.push({
+    const maxHp = computeTurretMaxHp(entry.tier);
+    const turretState = {
       uid: entry.uid,
       id: entry.id,
       team: entry.team,
@@ -401,15 +435,171 @@ async function loadTurrets() {
       tier: entry.tier,
       position: { x: entry.x, z: entry.z },
       cooldown: Math.random() * TURRET_ATTACK_INTERVAL,
-      target: null
-    });
+      target: null,
+      maxHp,
+      hp: maxHp,
+      destroyed: false,
+      attackable: false,
+      hitRadius: TURRET_HIT_RADIUS
+    };
+    turrets.push(turretState);
+    turretByUid.set(entry.uid, turretState);
+    ensureLaneBucket(entry.team, entry.lane).push(turretState);
   });
+  recomputeAllTurretAttackable();
   turretsReady = turrets.length > 0;
   if (!turretsReady) {
     logger.warn('No turret markers were loaded');
   } else {
     logger.info('Turrets loaded', { count: turrets.length });
+    broadcastTurretSnapshot();
   }
+}
+
+function serializeTurret(turret) {
+  if (!turret) return null;
+  return {
+    uid: turret.uid,
+    id: turret.id,
+    team: turret.team,
+    lane: turret.lane,
+    tier: turret.tier,
+    x: round2(turret.position?.x ?? 0),
+    z: round2(turret.position?.z ?? 0),
+    hp: Math.max(0, Math.round(turret.hp ?? 0)),
+    maxHp: Math.max(1, Math.round(turret.maxHp ?? TURRET_BASE_HP)),
+    attackable: Boolean(turret.attackable),
+    destroyed: Boolean(turret.destroyed),
+    hitRadius: Math.max(0.1, turret.hitRadius || TURRET_HIT_RADIUS)
+  };
+}
+
+function broadcastTurretSnapshot(targetSocket = null) {
+  if (!turretsReady || !turrets.length) return;
+  const payload = {
+    turrets: turrets.map(serializeTurret).filter(Boolean)
+  };
+  if (targetSocket) {
+    targetSocket.emit('turretSnapshot', payload);
+  } else if (io) {
+    io.emit('turretSnapshot', payload);
+  }
+}
+
+function broadcastTurretUpdate(turret, extra = {}) {
+  if (!io || !turret) return;
+  const payload = { ...serializeTurret(turret), ...extra };
+  io.emit('turretUpdate', payload);
+}
+
+function broadcastTurretDestroyed(turret, extra = {}) {
+  if (!io || !turret) return;
+  const payload = {
+    uid: turret.uid,
+    id: turret.id,
+    team: turret.team,
+    lane: turret.lane,
+    tier: turret.tier,
+    ...extra
+  };
+  io.emit('turretDestroyed', payload);
+}
+
+function recomputeLaneAttackable(team, lane) {
+  const bucket = turretsByLane.get(getLaneKey(team, lane));
+  if (!bucket || !bucket.length) {
+    return [];
+  }
+  bucket.sort((a, b) => (a.tier || 0) - (b.tier || 0));
+  const changed = [];
+  let unlocked = true;
+  bucket.forEach(turret => {
+    const shouldAttackable = unlocked && !turret.destroyed;
+    if (turret.attackable !== shouldAttackable) {
+      turret.attackable = shouldAttackable;
+      changed.push(turret);
+    }
+    if (!turret.destroyed) {
+      unlocked = false;
+    }
+  });
+  return changed;
+}
+
+function recomputeAllTurretAttackable() {
+  const changed = [];
+  turretsByLane.forEach((bucket, key) => {
+    if (!bucket || !bucket.length) return;
+    const [team, laneStr] = key.split(':');
+    const lane = Number.parseInt(laneStr, 10);
+    const updates = recomputeLaneAttackable(team, Number.isNaN(lane) ? null : lane);
+    if (updates.length) {
+      changed.push(...updates);
+    }
+  });
+  if (changed.length) {
+    changed.forEach(turret => broadcastTurretUpdate(turret));
+  }
+}
+
+function getTurretState(uid) {
+  if (!uid) return null;
+  return turretByUid.get(uid) || null;
+}
+
+function getAttackableTurretsForTeam(team) {
+  const enemy = getEnemyTeam(team);
+  if (!enemy) return [];
+  return turrets
+    .filter(turret => turret.team === enemy && !turret.destroyed && turret.attackable)
+    .map(turret => ({
+      uid: turret.uid,
+      team: turret.team,
+      lane: turret.lane,
+      tier: turret.tier,
+      position: { x: turret.position.x, z: turret.position.z },
+      radius: turret.hitRadius,
+      hp: turret.hp,
+      maxHp: turret.maxHp
+    }));
+}
+
+function damageTurret(uid, amount, { attackerId = null, source = 'unknown' } = {}) {
+  const turret = getTurretState(uid);
+  if (!turret || turret.destroyed) {
+    return { ok: false, destroyed: true, hp: 0, maxHp: turret?.maxHp ?? TURRET_BASE_HP };
+  }
+  if (!turret.attackable) {
+    return {
+      ok: false,
+      destroyed: false,
+      hp: turret.hp,
+      maxHp: turret.maxHp,
+      locked: true
+    };
+  }
+  const dmg = Math.max(0, Math.round(amount ?? 0));
+  if (dmg <= 0) {
+    return { ok: false, destroyed: false, hp: turret.hp, maxHp: turret.maxHp };
+  }
+  turret.hp = Math.max(0, turret.hp - dmg);
+  broadcastTurretUpdate(turret, { attackerId, source });
+  if (turret.hp > 0) {
+    return { ok: true, destroyed: false, hp: turret.hp, maxHp: turret.maxHp };
+  }
+
+  turret.hp = 0;
+  turret.destroyed = true;
+  turret.attackable = false;
+  turret.target = null;
+  broadcastTurretDestroyed(turret, { attackerId, source });
+
+  const laneUpdates = recomputeLaneAttackable(turret.team, turret.lane);
+  if (laneUpdates.length) {
+    laneUpdates.forEach(t => broadcastTurretUpdate(t));
+  }
+
+  return { ok: true, destroyed: true, hp: 0, maxHp: turret.maxHp };
 }
 
 function distanceSquared(ax, az, bx, bz) {
@@ -526,7 +716,7 @@ function broadcastTurretAttack(turret, targetPayload, targetState, extra = {}) {
 }
 
 function fireTurret(turret) {
-  if (!turret || !turret.target) {
+  if (!turret || turret.destroyed || !turret.target) {
     return;
   }
   if (turret.target.type === 'minion') {
@@ -563,6 +753,11 @@ function updateTurrets(dt) {
     return;
   }
   turrets.forEach(turret => {
+    if (turret.destroyed) {
+      turret.target = null;
+      turret.cooldown = 0;
+      return;
+    }
     turret.cooldown = Math.max(0, (turret.cooldown || 0) - dt);
     const validated = validateTurretTarget(turret);
     if (validated) {
@@ -623,6 +818,9 @@ function ensureGameLoop() {
     MinionManager.update(dt, {
       players,
       damagePlayer: applyDamage,
+      damageTurret,
+      getAttackableTurretsForTeam,
+      getTurretState
     });
     updateTurrets(dt);
     regeneratePlayers(dt);
@@ -639,7 +837,9 @@ function updateProjectiles(dt) {
   }
   for (let i = activeProjectiles.length - 1; i >= 0; i--) {
     const p = activeProjectiles[i];
-    const owner = players[p.ownerId];
+  const owner = players[p.ownerId];
+  const hasSpecificTarget = p.targetId !== undefined && p.targetId !== null;
+  const targetType = p.targetType || null;
     // homing: update direction toward current target position
     if (p.homing && p.targetId) {
       if (p.targetType === 'minion') {
@@ -672,37 +872,80 @@ function updateProjectiles(dt) {
     let hitTargetId = null;
     let hitTargetType = null;
 
-    if (!hit && p.targetType !== 'player') {
-      MinionManager.forEachMinion((minion) => {
+    const radiusSq = (p.radius || 0.6) * (p.radius || 0.6);
+
+    const tryHitMinion = (minion) => {
+      if (hit || !minion || minion.dead) return;
+      if (p.ownerId && owner && minion.team === owner.team) return;
+      const dx = (minion.position.x ?? 0) - p.x;
+      const dz = (minion.position.z ?? 0) - p.z;
+      const dist2 = dx * dx + dz * dz;
+      if (dist2 <= radiusSq) {
+        MinionManager.damageMinion(minion.id, p.damage ?? 5, { attackerId: p.ownerId, cause: p.source || 'AA' });
+        hitTargetId = minion.id;
+        hitTargetType = 'minion';
+        hit = true;
+      }
+    };
+
+    if (!hit && targetType === 'minion' && hasSpecificTarget) {
+      const targetMinion = MinionManager.getMinionById(p.targetId);
+      tryHitMinion(targetMinion);
+    }
+
+    if (!hit && (!targetType || (targetType === 'minion' && !hasSpecificTarget))) {
+      MinionManager.forEachMinion(minion => {
         if (hit) return;
-        if (!minion || minion.dead) return;
-        if (p.ownerId && owner && minion.team === owner.team) return;
-        const dx = (minion.position.x ?? 0) - p.x;
-        const dz = (minion.position.z ?? 0) - p.z;
-        const dist2 = dx * dx + dz * dz;
-        if (dist2 <= p.radius * p.radius) {
-          MinionManager.damageMinion(minion.id, p.damage ?? 5, { attackerId: p.ownerId, cause: p.source || 'AA' });
-          hitTargetId = minion.id;
-          hitTargetType = 'minion';
-          hit = true;
-        }
+        tryHitMinion(minion);
       });
     }
 
-    if (!hit && p.targetType !== 'minion') {
+    if (!hit && targetType === 'player' && hasSpecificTarget) {
+      const targetPlayer = players[p.targetId];
+      if (targetPlayer && !targetPlayer.dead && !areAllies(targetPlayer, owner)) {
+        const dx = targetPlayer.x - p.x;
+        const dz = targetPlayer.z - p.z;
+        const dist2 = dx * dx + dz * dz;
+        if (dist2 <= radiusSq) {
+          applyDamage(p.targetId, p.damage ?? 5, p.ownerId, p.source || 'AA');
+          hitTargetId = p.targetId;
+          hitTargetType = 'player';
+          hit = true;
+        }
+      }
+    }
+
+    if (!hit && (!targetType || (targetType === 'player' && !hasSpecificTarget))) {
       for (const [id, pl] of Object.entries(players)) {
-        if (id === p.ownerId) continue; // pas soi-même
+        if (hit) break;
+        if (id === p.ownerId) continue;
         if (pl.dead) continue;
         if (areAllies(pl, owner)) continue;
         const dx = pl.x - p.x;
         const dz = pl.z - p.z;
         const dist2 = dx*dx + dz*dz;
-        if (dist2 <= p.radius * p.radius) {
+        if (dist2 <= radiusSq) {
           applyDamage(id, p.damage ?? 5, p.ownerId, p.source || 'AA');
           hitTargetId = id;
           hitTargetType = 'player';
           hit = true;
-          break;
+        }
+      }
+    }
+
+    if (!hit && p.targetType === 'turret') {
+      const turret = getTurretState(p.targetId);
+      if (!turret || turret.destroyed) {
+        hit = true;
+      } else if (p.source === 'AA') {
+        const dx = (turret.position.x ?? 0) - p.x;
+        const dz = (turret.position.z ?? 0) - p.z;
+        const radius = (p.radius || 0.6) + (turret.hitRadius || TURRET_HIT_RADIUS);
+        if (dx * dx + dz * dz <= radius * radius) {
+          damageTurret(turret.uid, p.damage ?? 5, { attackerId: p.ownerId, source: p.source || 'AA' });
+          hitTargetId = turret.uid;
+          hitTargetType = 'turret';
+          hit = true;
         }
       }
     }
@@ -815,6 +1058,9 @@ module.exports = {
     broadcastProgress(player, { targetSocket: socket });
 
     MinionManager.handleConnection(socket);
+    if (turretsReady) {
+      broadcastTurretSnapshot(socket);
+    }
 
       const joinPayload = serializePlayer(players[socket.id]);
       logger.netOut('playerJoined', { from: socket.id, to: 'broadcast', data: joinPayload });
@@ -831,11 +1077,14 @@ module.exports = {
         if (!targetType) {
           targetType = typeof targetId === 'number' ? 'minion' : 'player';
         }
-        targetType = targetType === 'minion' ? 'minion' : 'player';
+        if (targetType !== 'player' && targetType !== 'minion' && targetType !== 'turret') {
+          targetType = typeof targetId === 'number' ? 'minion' : 'player';
+        }
         const from = players[fromId];
         if (!from || from.dead) return;
         let targetPlayer = null;
         let targetMinion = null;
+        let targetTurret = null;
         if (targetType === 'player') {
           targetPlayer = players[targetId];
           if (!targetPlayer || targetPlayer.dead) return;
@@ -843,6 +1092,10 @@ module.exports = {
         } else if (targetType === 'minion' && typeof targetId === 'number') {
           targetMinion = MinionManager.getMinionById(targetId);
           if (!targetMinion || targetMinion.dead || targetMinion.team === from.team) return;
+        } else if (targetType === 'turret' && typeof targetId === 'string') {
+          targetTurret = getTurretState(targetId);
+          if (!targetTurret || targetTurret.team === from.team || targetTurret.destroyed) return;
+          if (!targetTurret.attackable) return;
         } else {
           return;
         }
@@ -853,12 +1106,27 @@ module.exports = {
           from.z = round2(payloadPos.z);
         }
         const range = from.aaRange || getClassDefinition(from.classId).stats.autoAttack.range;
-        const targetXBase = targetType === 'player' ? (targetPlayer?.x ?? 0) : (targetMinion?.position?.x ?? 0);
-        const targetZBase = targetType === 'player' ? (targetPlayer?.z ?? 0) : (targetMinion?.position?.z ?? 0);
+        const targetXBase = targetType === 'player'
+          ? (targetPlayer?.x ?? 0)
+          : targetType === 'minion'
+            ? (targetMinion?.position?.x ?? 0)
+            : (targetTurret?.position?.x ?? 0);
+        const targetZBase = targetType === 'player'
+          ? (targetPlayer?.z ?? 0)
+          : targetType === 'minion'
+            ? (targetMinion?.position?.z ?? 0)
+            : (targetTurret?.position?.z ?? 0);
         const dx0 = (from.x ?? 0) - targetXBase;
         const dz0 = (from.z ?? 0) - targetZBase;
         const dist2 = dx0*dx0 + dz0*dz0;
-        if (dist2 > range * range) return; // hors portée
+        const targetRadius = targetType === 'player'
+          ? DEFAULT_PLAYER_TARGET_RADIUS
+          : targetType === 'minion'
+            ? (targetMinion?.radius || DEFAULT_MINION_TARGET_RADIUS)
+            : (targetTurret?.hitRadius || TURRET_HIT_RADIUS);
+        const projectileRadius = from.aaRadius || 0;
+        const effectiveRange = range + targetRadius + projectileRadius * 0.5;
+        if (dist2 > effectiveRange * effectiveRange) return; // hors portée
 
     const damage = (from.aaDamage ?? 5) + (from.nextAaBonus || 0);
         from.nextAaBonus = 0;
@@ -873,8 +1141,10 @@ module.exports = {
           });
           if (targetType === 'player') {
             applyDamage(targetId, damage, fromId, 'AA');
-          } else {
+          } else if (targetType === 'minion') {
             MinionManager.damageMinion(targetId, damage, { attackerId: fromId, cause: 'player-aa' });
+          } else if (targetType === 'turret') {
+            damageTurret(targetId, damage, { attackerId: fromId, source: 'player-aa' });
           }
 
       socket.on('setMinionSpawning', ({ enabled } = {}) => {
@@ -891,8 +1161,16 @@ module.exports = {
           // Attaque à distance avec projectile (travel-time)
           const startX = from.x;
           const startZ = from.z;
-          const targetX = targetType === 'player' ? targetPlayer.x : targetMinion.position.x;
-          const targetZ = targetType === 'player' ? targetPlayer.z : targetMinion.position.z;
+          const targetX = targetType === 'player'
+            ? targetPlayer.x
+            : targetType === 'minion'
+              ? targetMinion.position.x
+              : targetTurret.position.x;
+          const targetZ = targetType === 'player'
+            ? targetPlayer.z
+            : targetType === 'minion'
+              ? targetMinion.position.z
+              : targetTurret.position.z;
           const dirX = targetX - startX;
           const dirZ = targetZ - startZ;
           const dist = Math.hypot(dirX, dirZ) || 0.0001;
